@@ -273,3 +273,16 @@ See other scripts in the Intune folder for:
 ## License
 
 MIT License - Use at your own risk. Always test in non-production environments first.
+
+---
+
+## Related Scripts
+
+### Invoke-DomainJoinPrompt.ps1
+Interactive domain join utility with GUI and silent mode support.
+- Windows Forms UI for user-friendly domain joining
+- Pre-flight checks (DNS, DC connectivity)
+- Computer rename during join
+- OU selection support
+- Silent mode for automation
+- See [README-DomainJoin.md](README-DomainJoin.md) for details
