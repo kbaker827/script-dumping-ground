@@ -286,3 +286,18 @@ Interactive domain join utility with GUI and silent mode support.
 - OU selection support
 - Silent mode for automation
 - See [README-DomainJoin.md](README-DomainJoin.md) for details
+
+---
+
+## Additional Scripts
+
+### Get-IntuneInactiveIOSDevices.ps1
+Reports iOS/iPadOS devices that haven't synced to Intune within a specified timeframe.
+- Flexible date filtering (specific date or days of inactivity)
+- Filter by OS type (iOS, iPadOS, or both)
+- Filter by compliance state
+- Shows device group memberships (direct or transitive)
+- Multiple export formats (CSV, JSON, Excel)
+- Email report delivery
+- Multiple authentication methods (Interactive, Device Code, Managed Identity)
+- See [README-iOSInactiveDevices.md](README-iOSInactiveDevices.md) for details
