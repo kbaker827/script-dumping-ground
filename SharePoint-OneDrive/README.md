@@ -317,3 +317,15 @@ Increase minimum size threshold:
 ## License
 
 MIT License - Use at your own risk. Always review scan results before deleting data.
+
+---
+
+## Related Scripts
+
+### Force-SharePointPageCheckIn.ps1
+Administrative tool to force check-in, publish, and approve SharePoint Online pages stuck in checked-out state.
+- Single page or bulk operations
+- Force override any user's checkout
+- Auto-publish and auto-approve options
+- Multiple authentication methods (Interactive, Managed Identity, App-only)
+- See [README-ForceCheckIn.md](README-ForceCheckIn.md) for details
