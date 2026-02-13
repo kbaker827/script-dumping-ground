@@ -313,3 +313,89 @@ MIT License - Use at your own risk. Always test on non-production systems first.
 
 - Microsoft Docs: [Troubleshoot Windows device enrollment in Microsoft Intune](https://docs.microsoft.com/mem/intune/troubleshoot-device-enrollment)
 - dsregcmd documentation: [Azure AD joined device verification](https://docs.microsoft.com/azure/active-directory/devices/troubleshoot-device-dsregcmd)
+
+---
+
+## Remote Execution
+
+The script supports running repairs on remote computers via PowerShell Remoting.
+
+### Requirements for Remote Execution
+
+**Target Computers Must Have:**
+- Windows PowerShell/WinRM enabled
+- Windows Firewall allowing WinRM (port 5985/5986)
+- Administrator rights for the connecting account
+
+### Enable WinRM on Targets
+```powershell
+Enable-PSRemoting -Force
+# Or:
+winrm quickconfig -q
+```
+
+### Remote Examples
+
+#### Single Remote Computer
+```powershell
+.\Repair-IntuneEnrollment.ps1 -ComputerName "PC01" -UseCurrent
+```
+
+#### Multiple Remote Computers
+```powershell
+.\Repair-IntuneEnrollment.ps1 -ComputerName "PC01", "PC02", "PC03" -Credential (Get-Credential)
+```
+
+#### Pipeline from Active Directory
+```powershell
+Get-ADComputer -Filter {Enabled -eq $true} | 
+    Select-Object -ExpandProperty Name | 
+    .\Repair-IntuneEnrollment.ps1 -AutoFix -UseCurrent
+```
+
+#### Auto-Fix All Domain Computers
+```powershell
+Get-ADComputer -Filter {Enabled -eq $true} | 
+    Select-Object -ExpandProperty Name | 
+    .\Repair-IntuneEnrollment.ps1 -AutoFix -TriggerSync
+```
+
+#### Check Certificates on Remote Machines
+```powershell
+.\Repair-IntuneEnrollment.ps1 -ComputerName (Get-Content computers.txt) -CheckCertificates -TriggerSync -UseCurrent
+```
+
+### Remote Output
+
+When running remotely, the script connects to each computer and:
+1. Tests connectivity (ping then WinRM)
+2. Executes repairs via embedded script block
+3. Returns status and fix summary
+4. Logs details on the remote machine
+
+**Example Remote Output:**
+```
+[*] Connecting to PC01...
+[!] Ping failed for PC01, attempting WinRM anyway...
+[*] Executing repair on PC01...
+[+] PC01: Status = Partial, Fixes = 3
+[*] Connecting to PC02...
+[+] PC02: Status = Healthy, Fixes = 0
+```
+
+### Remote Log Locations
+
+On each target computer, logs are saved to:
+- `C:\Users\<username>\AppData\Local\Temp\IntuneRepair_*.log`
+
+The central log on the executing machine contains:
+- Connection status for each computer
+- Summary of fixes applied
+- Errors encountered
+
+### Security Notes
+
+- Credentials are never logged
+- Use `-UseCurrent` for pass-through authentication when possible
+- For bulk operations, consider using a service account
+- Ensure target computers are in TrustedHosts if workgroup: `Set-Item WSMan:\localhost\Client\TrustedHosts -Value "*" -Force`

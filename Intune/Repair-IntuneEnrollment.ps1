@@ -1,12 +1,14 @@
 <#
 .SYNOPSIS
-    Repairs broken or partial Intune/Azure AD device registrations.
+    Repairs broken or partial Intune/Azure AD device registrations - works locally or remotely.
 
 .DESCRIPTION
     This script diagnoses and repairs common issues with Intune/Azure AD enrollment
     including partial registrations, stuck states, certificate problems, and
     failed MDM enrollments after Azure AD join.
 
+    Can run locally or remotely via PowerShell Remoting.
+    
     Fixes applied:
     - Detects partial registration states (Azure AD joined but not MDM enrolled)
     - Cleans up corrupted registry entries
@@ -14,6 +16,15 @@
     - Re-triggers MDM auto-enrollment
     - Resets device registration state if needed
     - Forces Group Policy / MDM sync
+
+.PARAMETER ComputerName
+    Remote computer(s) to repair. If omitted, runs locally.
+
+.PARAMETER Credential
+    Credentials for remote authentication.
+
+.PARAMETER UseCurrent
+    Use current credentials for remote connection (no prompt).
 
 .PARAMETER AutoFix
     Automatically apply fixes without prompting for each step.
@@ -36,24 +47,35 @@
 .PARAMETER WhatIf
     Show what would be done without making changes.
 
+.PARAMETER Force
+    Suppress confirmation prompts.
+
 .EXAMPLE
     .\Repair-IntuneEnrollment.ps1
-    Diagnoses and repairs with interactive prompts.
+    Diagnoses and repairs local machine with interactive prompts.
+
+.EXAMPLE
+    .\Repair-IntuneEnrollment.ps1 -ComputerName PC01 -UseCurrent
+    Repairs remote computer PC01 using current credentials.
+
+.EXAMPLE
+    .\Repair-IntuneEnrollment.ps1 -ComputerName PC01,PC02,PC03 -Credential (Get-Credential)
+    Repairs multiple remote computers.
 
 .EXAMPLE
     .\Repair-IntuneEnrollment.ps1 -AutoFix
-    Automatically applies all safe fixes.
+    Automatically applies all safe fixes locally.
 
 .EXAMPLE
     .\Repair-IntuneEnrollment.ps1 -ResetRegistration -Force
     Full reset of device registration (requires re-enrollment).
 
 .EXAMPLE
-    .\Repair-IntuneEnrollment.ps1 -CheckCertificates -TriggerSync
-    Fixes certificate issues and forces sync.
+    Get-ADComputer -Filter {Enabled -eq $true} | Select-Object -ExpandProperty Name | .\Repair-IntuneEnrollment.ps1 -AutoFix
+    Pipeline input from Active Directory with auto-fix.
 
 .NOTES
-    Version:        1.0
+    Version:        1.1
     Author:         IT Admin
     Updated:        2026-02-13
     
@@ -62,6 +84,7 @@
     - PowerShell 5.1+ 
     - Administrator rights
     - Internet connectivity to Azure AD/Intune
+    - For remote: WinRM enabled on targets
     
     Exit Codes:
     0   - Repairs successful
@@ -69,39 +92,35 @@
     2   - Requires manual intervention
     3   - No repairs needed (device healthy)
     4   - Critical failure / needs reset
+    5   - Remote connection failed
 #>
 
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
+    [Parameter(ValueFromPipeline=$true, ValueFromPipelineByPropertyName=$true, Position=0)]
+    [Alias('CN', 'MachineName', 'Name')]
+    [string[]]$ComputerName,
+    
+    [PSCredential]$Credential,
+    [switch]$UseCurrent,
+    
     [switch]$AutoFix,
     [switch]$ResetRegistration,
     [switch]$ForceReenroll,
     [switch]$CheckCertificates,
     [switch]$TriggerSync,
+    
     [string]$LogPath = (Join-Path $env:TEMP "IntuneRepair_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"),
-    [switch]$WhatIf
+    
+    [switch]$WhatIf,
+    [switch]$Force
 )
 
 #region Configuration
 $ErrorActionPreference = 'Continue'
-$script:Version = "1.0"
+$script:Version = "1.1"
 $script:StartTime = Get-Date
-$script:IssuesFound = [System.Collections.Generic.List[string]]::new()
-$script:FixesApplied = [System.Collections.Generic.List[string]]::new()
-$script:FixesFailed = [System.Collections.Generic.List[string]]::new()
-
-# Registry paths
-$script:MDMRegistryPaths = @(
-    'HKLM:\SOFTWARE\Microsoft\Enrollments',
-    'HKLM:\SOFTWARE\Microsoft\Enrollments\Status',
-    'HKLM:\SOFTWARE\Microsoft\Provisioning\OMADM\Accounts',
-    'HKLM:\SOFTWARE\Microsoft\Provisioning\OMADM\Logger',
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MDM'
-)
-
-$script:AzureADRegistryPaths = @(
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CDJ\AAD'
-)
+$script:Results = [System.Collections.Generic.List[object]]::new()
 #endregion
 
 #region Helper Functions
@@ -146,548 +165,437 @@ function Show-Header {
     Write-Host "========================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Log "Started: $($script:StartTime.ToString('yyyy-MM-dd HH:mm:ss'))" -Level Detail
-    Write-Log "Computer: $env:COMPUTERNAME" -Level Detail
     Write-Log "Log: $LogPath" -Level Detail
-    Write-Host ""
 }
 
-function Test-AdminRights {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
-    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-function Get-EnrollmentState {
-    $state = @{
-        AzureAdJoined = $false
-        AzureAdJoinType = $null
-        MdmEnrolled = $false
-        MdmUrl = $null
-        DeviceId = $null
-        TenantId = $null
-        TenantName = $null
-        UserEmail = $null
-        CertThumbprint = $null
-        CertValid = $false
-        EnrollmentStatus = 'Unknown'
-        Issues = [System.Collections.Generic.List[string]]::new()
-    }
-    
-    try {
-        $dsregOutput = dsregcmd /status 2>&1
-        $dsregText = $dsregOutput | Out-String
-        
-        # Azure AD Join
-        if ($dsregText -match 'AzureAdJoined\s*:\s*(\w+)') {
-            $state.AzureAdJoined = $matches[1] -eq 'YES'
-        }
-        
-        # Workplace Join
-        if ($dsregText -match 'WorkplaceJoined\s*:\s*(\w+)') {
-            if ($matches[1] -eq 'YES' -and -not $state.AzureAdJoined) {
-                $state.AzureAdJoinType = "Workplace"
-                $state.Issues.Add("Device is Workplace joined but not Azure AD joined")
-            }
-        }
-        
-        # MDM Enrollment
-        if ($dsregText -match 'MdmUrl\s*:\\s*(https?://\S+)') {
-            $state.MdmUrl = $matches[1].Trim()
-            $state.MdmEnrolled = $true
-        } elseif ($dsregText -match 'MdmUrl\s*:\\s*(\S+)') {
-            $mdmValue = $matches[1].Trim()
-            if ($mdmValue -and $mdmValue -ne '') {
-                $state.MdmUrl = $mdmValue
-                $state.MdmEnrolled = $true
-            }
-        }
-        
-        # Device ID
-        if ($dsregText -match 'DeviceId\s*:\\s*([a-f0-9-]+)') {
-            $state.DeviceId = $matches[1].Trim()
-        }
-        
-        # Tenant
-        if ($dsregText -match 'TenantId\s*:\\s*([a-f0-9-]+)') {
-            $state.TenantId = $matches[1].Trim()
-        }
-        if ($dsregText -match 'TenantName\s*:\\s*(.+)') {
-            $state.TenantName = $matches[1].Trim()
-        }
-        
-        # User
-        if ($dsregText -match 'UserEmail\s*:\\s*(\S+@\S+)') {
-            $state.UserEmail = $matches[1].Trim()
-        }
-        
-        # Check certificate
-        $certPath = "Cert:\LocalMachine\My"
-        $mdmCert = Get-ChildItem -Path $certPath | Where-Object { 
-            $_.Subject -match "MDM" -or $_.Issuer -match "Microsoft Intune" 
-        } | Select-Object -First 1
-        
-        if ($mdmCert) {
-            $state.CertThumbprint = $mdmCert.Thumbprint
-            $state.CertValid = ($mdmCert.NotAfter -gt (Get-Date)) -and ($mdmCert.NotBefore -lt (Get-Date))
-            
-            if (-not $state.CertValid) {
-                $state.Issues.Add("MDM certificate has expired or is not yet valid")
-            }
-        } else {
-            if ($state.MdmEnrolled) {
-                $state.Issues.Add("MDM enrolled but no certificate found")
-            }
-        }
-        
-        # Determine enrollment status
-        if ($state.AzureAdJoined -and $state.MdmEnrolled -and $state.CertValid) {
-            $state.EnrollmentStatus = 'Healthy'
-        } elseif ($state.AzureAdJoined -and -not $state.MdmEnrolled) {
-            $state.EnrollmentStatus = 'Partial'
-            $state.Issues.Add("Azure AD joined but MDM not enrolled (partial registration)")
-        } elseif (-not $state.AzureAdJoined -and $state.MdmEnrolled) {
-            $state.EnrollmentStatus = 'Orphaned'
-            $state.Issues.Add("MDM enrolled but not Azure AD joined (orphaned state)")
-        } elseif (-not $state.AzureAdJoined -and -not $state.MdmEnrolled) {
-            $state.EnrollmentStatus = 'NotRegistered'
-            $state.Issues.Add("Device not enrolled in Azure AD or Intune")
-        } else {
-            $state.EnrollmentStatus = 'Degraded'
-            $state.Issues.Add("Enrollment state degraded - certificate or connectivity issues")
-        }
-    }
-    catch {
-        Write-Log "Error checking enrollment state: $($_.Exception.Message)" -Level Error
-        $state.Issues.Add("Failed to check enrollment state: $($_.Exception.Message)")
-    }
-    
-    return $state
-}
-
-function Show-EnrollmentStatus {
-    param([hashtable]$State)
-    
+function Show-Summary {
     Write-Host ""
     Write-Host "========================================" -ForegroundColor Cyan
-    Write-Host "  ENROLLMENT STATUS" -ForegroundColor Cyan
+    Write-Host "  SUMMARY" -ForegroundColor Cyan
     Write-Host "========================================" -ForegroundColor Cyan
     Write-Host ""
     
-    Write-Log "Azure AD Joined: $($State.AzureAdJoined)" -Level $(if ($State.AzureAdJoined) { 'Success' } else { 'Warning' })
-    Write-Log "MDM Enrolled: $($State.MdmEnrolled)" -Level $(if ($State.MdmEnrolled) { 'Success' } else { 'Warning' })
-    Write-Log "Certificate Valid: $($State.CertValid)" -Level $(if ($State.CertValid) { 'Success' } else { 'Warning' })
-    Write-Log "Overall Status: $($State.EnrollmentStatus)" -Level $(
-        switch ($State.EnrollmentStatus) {
-            'Healthy' { 'Success' }
-            'Partial' { 'Warning' }
-            'Orphaned' { 'Error' }
-            'Degraded' { 'Warning' }
-            default { 'Info' }
+    $total = $script:Results.Count
+    $success = ($script:Results | Where-Object { $_.Success }).Count
+    $failed = ($script:Results | Where-Object { -not $_.Success }).Count
+    $healthy = ($script:Results | Where-Object { $_.Status -eq 'Healthy' }).Count
+    
+    Write-Log "Total computers: $total" -Level Info
+    Write-Log "Successful repairs: $success" -Level $(if ($success -gt 0) { 'Success' } else { 'Info' })
+    Write-Log "Already healthy: $healthy" -Level Success
+    Write-Log "Failed: $failed" -Level $(if ($failed -gt 0) { 'Error' } else { 'Success' })
+    
+    if ($failed -gt 0) {
+        Write-Host ""
+        Write-Log "Failed computers:" -Level Error
+        $script:Results | Where-Object { -not $_.Success } | ForEach-Object {
+            Write-Log "  - $($_.ComputerName): $($_.Error)" -Level Error
         }
+    }
+    
+    $duration = (Get-Date) - $script:StartTime
+    Write-Host ""
+    Write-Log "Duration: $($duration.ToString('mm\:ss'))" -Level Info
+    Write-Log "Log saved: $LogPath" -Level Info
+}
+#endregion
+
+#region Local Repair Functions
+function Invoke-LocalRepair {
+    param(
+        [switch]$IsAutoFix,
+        [switch]$DoReset,
+        [switch]$DoForceReenroll,
+        [switch]$CheckCerts,
+        [switch]$DoSync,
+        [switch]$IsWhatIf
     )
     
-    if ($State.TenantName) {
-        Write-Log "Tenant: $($State.TenantName)" -Level Detail
-    }
-    if ($State.UserEmail) {
-        Write-Log "User: $($State.UserEmail)" -Level Detail
-    }
-    if ($State.DeviceId) {
-        Write-Log "Device ID: $($State.DeviceId)" -Level Detail
+    $repairResult = @{
+        Success = $false
+        Status = 'Unknown'
+        FixesApplied = @()
+        FixesFailed = @()
+        Error = $null
     }
     
-    if ($State.Issues.Count -gt 0) {
-        Write-Host ""
-        Write-Log "Issues Found:" -Level Warning
-        foreach ($issue in $State.Issues) {
-            Write-Log "  - $issue" -Level Warning
-            $script:IssuesFound.Add($issue)
-        }
+    # Check admin rights
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    $isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    
+    if (-not $isAdmin) {
+        $repairResult.Error = "Administrator privileges required"
+        return $repairResult
     }
     
-    Write-Host ""
-}
-
-function Repair-MDMRegistry {
-    Write-Log "Checking MDM registry entries..." -Level Info
-    
-    $fixed = $false
-    
-    # Check MDM auto-enrollment setting
-    $mdmPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\MDM'
-    if (Test-Path $mdmPath) {
-        $autoEnroll = Get-ItemProperty -Path $mdmPath -Name 'AutoEnrollMDM' -ErrorAction SilentlyContinue
-        if (-not $autoEnroll -or $autoEnroll.AutoEnrollMDM -ne 1) {
-            if ($PSCmdlet.ShouldProcess($mdmPath, "Enable MDM Auto-Enrollment")) {
-                try {
-                    if (-not (Test-Path $mdmPath)) {
-                        New-Item -Path $mdmPath -Force | Out-Null
-                    }
-                    Set-ItemProperty -Path $mdmPath -Name 'AutoEnrollMDM' -Value 1 -Type DWord -Force
-                    Write-Log "Enabled MDM auto-enrollment in registry" -Level Success
-                    $script:FixesApplied.Add("Enabled MDM auto-enrollment")
-                    $fixed = $true
-                }
-                catch {
-                    Write-Log "Failed to set MDM auto-enrollment: $($_.Exception.Message)" -Level Error
-                    $script:FixesFailed.Add("MDM auto-enrollment registry")
-                }
-            }
-        }
+    # Helper: Write local log
+    $localLogPath = Join-Path $env:TEMP "IntuneRepair_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+    function Write-LocalLog($Msg, $Lvl='Info') {
+        "$([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss')) [$Lvl] $Msg" | 
+            Out-File -FilePath $localLogPath -Append -Encoding UTF8
     }
     
-    # Check for corrupt enrollment entries
-    $enrollmentsPath = 'HKLM:\SOFTWARE\Microsoft\Enrollments'
-    if (Test-Path $enrollmentsPath) {
-        $enrollments = Get-ChildItem -Path $enrollmentsPath -ErrorAction SilentlyContinue | 
-            Where-Object { $_.PSChildName -match '^[0-9a-f]{8}-' }
+    Write-LocalLog "Starting local repair on $env:COMPUTERNAME"
+    
+    # Get enrollment state via dsregcmd
+    try {
+        $dsregOutput = & dsregcmd /status 2>&1
+        $dsregText = $dsregOutput | Out-String
         
-        foreach ($enrollment in $enrollments) {
-            $props = Get-ItemProperty -Path $enrollment.PSPath -ErrorAction SilentlyContinue
-            if ($props -and ($props.PSObject.Properties.Name -contains 'EnrollmentState')) {
-                if ($props.EnrollmentState -eq 6) { # 6 = Enrollment failed
-                    Write-Log "Found failed enrollment: $($enrollment.PSChildName)" -Level Warning
-                    
-                    if ($AutoFix -or $PSCmdlet.ShouldProcess($enrollment.PSChildName, "Remove failed enrollment")) {
-                        try {
-                            Remove-Item -Path $enrollment.PSPath -Recurse -Force
-                            Write-Log "Removed failed enrollment entry" -Level Success
-                            $script:FixesApplied.Add("Removed failed enrollment: $($enrollment.PSChildName)")
-                            $fixed = $true
-                        }
-                        catch {
-                            Write-Log "Failed to remove enrollment: $($_.Exception.Message)" -Level Error
-                            $script:FixesFailed.Add("Remove enrollment: $($enrollment.PSChildName)")
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    return $fixed
-}
-
-function Repair-MDMCertificates {
-    Write-Log "Checking MDM certificates..." -Level Info
-    
-    $fixed = $false
-    $certPath = "Cert:\LocalMachine\My"
-    
-    # Find expired or invalid MDM certificates
-    $mdmCerts = Get-ChildItem -Path $certPath | Where-Object { 
-        $_.Subject -match "MDM" -or $_.Issuer -match "Microsoft Intune" 
-    }
-    
-    foreach ($cert in $mdmCerts) {
-        if ($cert.NotAfter -lt (Get-Date)) {
-            Write-Log "Found expired MDM certificate: $($cert.Thumbprint)" -Level Warning
-            
-            if ($AutoFix -or $PSCmdlet.ShouldProcess($cert.Thumbprint, "Remove expired certificate")) {
-                try {
-                    Remove-Item -Path $cert.PSPath -Force
-                    Write-Log "Removed expired certificate" -Level Success
-                    $script:FixesApplied.Add("Removed expired MDM certificate")
-                    $fixed = $true
-                }
-                catch {
-                    Write-Log "Failed to remove certificate: $($_.Exception.Message)" -Level Error
-                    $script:FixesFailed.Add("Remove expired certificate")
-                }
-            }
-        }
-    }
-    
-    # Also check and remove from Personal store if needed
-    $userCertPath = "Cert:\CurrentUser\My"
-    $userMdmCerts = Get-ChildItem -Path $userCertPath | Where-Object { 
-        $_.Subject -match "MDM" -or $_.Issuer -match "Microsoft Intune" 
-    }
-    
-    foreach ($cert in $userMdmCerts) {
-        if ($cert.NotAfter -lt (Get-Date)) {
-            Write-Log "Found expired user MDM certificate: $($cert.Thumbprint)" -Level Warning
-            
-            if ($AutoFix -or $PSCmdlet.ShouldProcess($cert.Thumbprint, "Remove expired user certificate")) {
-                try {
-                    Remove-Item -Path $cert.PSPath -Force
-                    Write-Log "Removed expired user certificate" -Level Success
-                    $script:FixesApplied.Add("Removed expired user MDM certificate")
-                    $fixed = $true
-                }
-                catch {
-                    Write-Log "Failed to remove user certificate: $($_.Exception.Message)" -Level Error
-                }
-            }
-        }
-    }
-    
-    return $fixed
-}
-
-function Invoke-MDMEnrollmentTrigger {
-    Write-Log "Triggering MDM enrollment..." -Level Info
-    
-    $triggered = $false
-    
-    # Method 1: Device enrollment scheduled task
-    $enrollTask = Get-ScheduledTask -TaskName "DeviceEnrollment*" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($enrollTask) {
-        try {
-            Start-ScheduledTask -TaskName $enrollTask.TaskName
-            Write-Log "Triggered device enrollment task" -Level Success
-            $script:FixesApplied.Add("Triggered device enrollment task")
-            $triggered = $true
-        }
-        catch {
-            Write-Log "Failed to trigger enrollment task: $($_.Exception.Message)" -Level Warning
-        }
-    }
-    
-    # Method 2: MDM enrollment URL
-    try {
-        $enrollUrl = "ms-device-enrollment:?mode=mdm"
-        Start-Process $enrollUrl -ErrorAction SilentlyContinue
-        Write-Log "Opened MDM enrollment dialog" -Level Info
-    }
-    catch {
-        Write-Log "Failed to open enrollment dialog: $($_.Exception.Message)" -Level Warning
-    }
-    
-    # Method 3: Auto-enrollment via settings
-    try {
-        $settingsPath = "ms-settings:workplace"
-        Start-Process $settingsPath -ErrorAction SilentlyContinue
-    }
-    catch {}
-    
-    return $triggered
-}
-
-function Invoke-AzureADSync {
-    Write-Log "Syncing Azure AD registration..." -Level Info
-    
-    try {
-        $result = dsregcmd /sync 2>&1
-        Start-Sleep -Seconds 5
+        $azureAdJoined = $dsregText -match 'AzureAdJoined\s*:\s*YES'
+        $mdmEnrolled = $dsregText -match 'MdmUrl\s*:\\s*(https?://\S+|\S+)'
         
-        # Check if sync worked
-        $newStatus = Get-EnrollmentState
-        if ($newStatus.AzureAdJoined) {
-            Write-Log "Azure AD sync completed successfully" -Level Success
-            $script:FixesApplied.Add("Azure AD sync")
-            return $true
+        # Determine status
+        if ($azureAdJoined -and $mdmEnrolled) {
+            $repairResult.Status = 'Healthy'
+            Write-LocalLog "Status: Healthy (Azure AD joined + MDM enrolled)" 'Success'
+        } elseif ($azureAdJoined -and -not $mdmEnrolled) {
+            $repairResult.Status = 'Partial'
+            Write-LocalLog "Status: Partial (Azure AD joined, MDM not enrolled)" 'Warning'
+        } elseif (-not $azureAdJoined -and $mdmEnrolled) {
+            $repairResult.Status = 'Orphaned'
+            Write-LocalLog "Status: Orphaned (MDM enrolled, Azure AD not joined)" 'Warning'
         } else {
-            Write-Log "Azure AD sync completed but status unchanged" -Level Warning
-            return $false
+            $repairResult.Status = 'NotRegistered'
+            Write-LocalLog "Status: Not registered" 'Warning'
         }
     }
     catch {
-        Write-Log "Azure AD sync failed: $($_.Exception.Message)" -Level Error
-        return $false
-    }
-}
-
-function Reset-DeviceRegistration {
-    param([switch]$Force)
-    
-    Write-Log "WARNING: This will reset device registration completely!" -Level Error
-    Write-Log "Device will need to be re-enrolled in Azure AD and Intune!" -Level Error
-    
-    if (-not $Force) {
-        $confirm = Read-Host "Are you sure you want to reset device registration? Type 'RESET' to confirm"
-        if ($confirm -ne 'RESET') {
-            Write-Log "Reset cancelled by user" -Level Info
-            return $false
-        }
+        $repairResult.Error = "Failed to check enrollment: $($_.Exception.Message)"
+        return $repairResult
     }
     
-    Write-Log "Resetting device registration..." -Level Info
-    
-    try {
-        # Leave Azure AD
-        $leaveResult = dsregcmd /leave 2>&1
-        Write-Log "Left Azure AD" -Level Info
-        
-        # Clear enrollment data
-        $enrollmentsPath = 'HKLM:\SOFTWARE\Microsoft\Enrollments'
-        if (Test-Path $enrollmentsPath) {
-            Remove-Item -Path $enrollmentsPath -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Log "Cleared enrollment registry" -Level Success
-        }
-        
-        # Clear certificates
-        $certPaths = @("Cert:\LocalMachine\My", "Cert:\CurrentUser\My")
-        foreach ($certPath in $certPaths) {
-            $mdmCerts = Get-ChildItem -Path $certPath | Where-Object { 
-                $_.Subject -match "MDM|AzureAD|Microsoft" 
+    # If healthy, just sync if requested
+    if ($repairResult.Status -eq 'Healthy') {
+        if ($DoSync) {
+            try {
+                Invoke-WmiMethod -Namespace "root\ccm" -Class SMS_Client -Name TriggerSchedule "{00000000-0000-0000-0000-000000000021}" -ErrorAction SilentlyContinue | Out-Null
+                Write-LocalLog "Triggered MDM sync" 'Success'
+                $repairResult.FixesApplied += "MDM sync"
             }
-            foreach ($cert in $mdmCerts) {
-                Remove-Item -Path $cert.PSPath -Force -ErrorAction SilentlyContinue
+            catch {
+                Write-LocalLog "MDM sync failed: $($_.Exception.Message)" 'Warning'
             }
         }
-        Write-Log "Cleared MDM certificates" -Level Success
-        
-        $script:FixesApplied.Add("Complete device registration reset")
-        
-        Write-Log "Device registration reset complete" -Level Success
-        Write-Log "You must re-enroll this device in Azure AD/Intune manually!" -Level Warning
-        Write-Log "Go to Settings > Accounts > Access work or school > Connect" -Level Info
-        
-        return $true
+        $repairResult.Success = $true
+        return $repairResult
     }
-    catch {
-        Write-Log "Reset failed: $($_.Exception.Message)" -Level Error
-        $script:FixesFailed.Add("Device registration reset")
-        return $false
-    }
-}
-
-function Invoke-MDMSync {
-    Write-Log "Triggering MDM policy sync..." -Level Info
     
-    try {
-        # Method 1: Scheduled task
-        $mdmTask = Get-ScheduledTask -TaskName "Schedule created by MDM*" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($mdmTask) {
-            Start-ScheduledTask -TaskName $mdmTask.TaskName
-            Write-Log "Triggered MDM scheduled task" -Level Success
+    # Apply fixes if not whatif
+    if (-not $IsWhatIf) {
+        # Fix 1: Enable MDM auto-enrollment
+        if ($repairResult.Status -eq 'Partial' -or $repairResult.Status -eq 'NotRegistered') {
+            try {
+                $mdmPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\MDM'
+                if (-not (Test-Path $mdmPath)) {
+                    New-Item -Path $mdmPath -Force | Out-Null
+                }
+                Set-ItemProperty -Path $mdmPath -Name 'AutoEnrollMDM' -Value 1 -Type DWord -Force
+                Write-LocalLog "Enabled MDM auto-enrollment" 'Success'
+                $repairResult.FixesApplied += "Enabled MDM auto-enrollment"
+            }
+            catch {
+                Write-LocalLog "Failed to enable auto-enrollment: $($_.Exception.Message)" 'Error'
+                $repairResult.FixesFailed += "MDM auto-enrollment"
+            }
         }
         
-        # Method 2: WMI
+        # Fix 2: Remove expired certificates
+        if ($CheckCerts) {
+            try {
+                $certPath = "Cert:\LocalMachine\My"
+                $expiredCerts = Get-ChildItem -Path $certPath | Where-Object { 
+                    ($_.Subject -match "MDM" -or $_.Issuer -match "Microsoft Intune") -and 
+                    $_.NotAfter -lt (Get-Date)
+                }
+                foreach ($cert in $expiredCerts) {
+                    Remove-Item -Path $cert.PSPath -Force
+                    Write-LocalLog "Removed expired cert: $($cert.Thumbprint)" 'Success'
+                    $repairResult.FixesApplied += "Removed expired certificate"
+                }
+            }
+            catch {
+                Write-LocalLog "Certificate cleanup failed: $($_.Exception.Message)" 'Warning'
+            }
+        }
+        
+        # Fix 3: Azure AD sync
+        if ($repairResult.Status -eq 'Partial' -or $azureAdJoined) {
+            try {
+                & dsregcmd /sync 2>&1 | Out-Null
+                Start-Sleep -Seconds 5
+                Write-LocalLog "Azure AD sync completed" 'Success'
+                $repairResult.FixesApplied += "Azure AD sync"
+            }
+            catch {
+                Write-LocalLog "Azure AD sync failed: $($_.Exception.Message)" 'Warning'
+            }
+        }
+        
+        # Fix 4: Trigger enrollment
+        if ($repairResult.Status -eq 'Partial') {
+            try {
+                $enrollTask = Get-ScheduledTask -TaskName "DeviceEnrollment*" -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($enrollTask) {
+                    Start-ScheduledTask -TaskName $enrollTask.TaskName
+                    Write-LocalLog "Triggered device enrollment task" 'Success'
+                    $repairResult.FixesApplied += "Triggered enrollment task"
+                }
+            }
+            catch {
+                Write-LocalLog "Enrollment trigger failed: $($_.Exception.Message)" 'Warning'
+            }
+        }
+        
+        # Fix 5: Full reset if requested
+        if ($DoReset -or $DoForceReenroll) {
+            try {
+                & dsregcmd /leave 2>&1 | Out-Null
+                Write-LocalLog "Left Azure AD" 'Success'
+                $repairResult.FixesApplied += "Left Azure AD (reset)"
+                $repairResult.Status = 'Reset'
+            }
+            catch {
+                Write-LocalLog "Reset failed: $($_.Exception.Message)" 'Error'
+                $repairResult.FixesFailed += "Azure AD leave"
+            }
+        }
+        
+        # Final sync
+        if ($DoSync -and $repairResult.FixesApplied.Count -gt 0) {
+            Start-Sleep -Seconds 10
+            try {
+                Invoke-WmiMethod -Namespace "root\ccm" -Class SMS_Client -Name TriggerSchedule "{00000000-0000-0000-0000-000000000021}" -ErrorAction SilentlyContinue | Out-Null
+                Write-LocalLog "Final MDM sync triggered" 'Success'
+            }
+            catch {}
+        }
+    }
+    else {
+        Write-LocalLog "WHATIF MODE - No changes made" 'Warning'
+        $repairResult.FixesApplied += "[WHATIF] Would apply repairs"
+    }
+    
+    $repairResult.Success = ($repairResult.FixesFailed.Count -eq 0 -or $repairResult.FixesApplied.Count -gt 0)
+    return $repairResult
+}
+#endregion
+
+#region Remote Execution
+function Invoke-RemoteRepair {
+    param(
+        [string]$Computer,
+        [PSCredential]$Cred
+    )
+    
+    Write-Log "Connecting to $Computer..." -Level Info
+    
+    $result = [PSCustomObject]@{
+        ComputerName = $Computer
+        Success = $false
+        Status = 'Unknown'
+        FixesApplied = @()
+        Error = $null
+    }
+    
+    try {
+        # Test connection
+        if (-not (Test-Connection -ComputerName $Computer -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
+            Write-Log "Ping failed for $Computer, attempting WinRM anyway..." -Level Warning
+        }
+        
+        # Check WinRM
+        Test-WSMan -ComputerName $Computer -ErrorAction Stop | Out-Null
+        
+        # Build and execute remote script
+        $scriptBlock = {
+            param($Params)
+            
+            # Create temp script
+            $tempScript = Join-Path $env:TEMP "IntuneRepair_$(Get-Random).ps1"
+            
+            $scriptContent = @'
+param($AutoFix, $Reset, $ForceReenroll, $CheckCerts, $Sync, $WhatIf)
+$ErrorActionPreference = 'SilentlyContinue'
+
+function Write-Log($Msg, $Lvl='Info') {
+    "$([DateTime]::Now.ToString('s')) [$Lvl] $Msg" | 
+        Out-File -FilePath "$env:TEMP\IntuneRepair.log" -Append -Encoding UTF8
+}
+
+$result = @{ Success=$false; Status='Unknown'; FixesApplied=@(); FixesFailed=@() }
+
+# Check admin
+$id = [Security.Principal.WindowsIdentity]::GetCurrent()
+$p = New-Object Security.Principal.WindowsPrincipal($id)
+if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $result.Error = "Admin required"
+    return $result
+}
+
+# Get status
+$dsreg = & dsregcmd /status 2>&1
+$aad = $dsreg -match 'AzureAdJoined\s*:\s*YES'
+$mdm = $dsreg -match 'MdmUrl\s*:.*https'
+
+if ($aad -and $mdm) { $result.Status = 'Healthy' }
+elseif ($aad -and -not $mdm) { $result.Status = 'Partial' }
+elseif (-not $aad -and $mdm) { $result.Status = 'Orphaned' }
+else { $result.Status = 'NotRegistered' }
+
+if (-not $WhatIf) {
+    # Enable auto-enrollment
+    if ($result.Status -eq 'Partial' -or $result.Status -eq 'NotRegistered') {
+        $path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CurrentVersion\MDM'
+        if (-not (Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+        Set-ItemProperty -Path $path -Name 'AutoEnrollMDM' -Value 1 -Type DWord -Force
+        $result.FixesApplied += "MDM auto-enrollment"
+    }
+    
+    # Sync
+    if ($aad) {
+        & dsregcmd /sync 2>&1 | Out-Null
+        Start-Sleep -Seconds 5
+        $result.FixesApplied += "Azure AD sync"
+    }
+    
+    # Trigger enrollment
+    if ($result.Status -eq 'Partial') {
+        $task = Get-ScheduledTask -TaskName "DeviceEnrollment*" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($task) { Start-ScheduledTask -TaskName $task.TaskName; $result.FixesApplied += "Enrollment task" }
+    }
+    
+    # Reset
+    if ($Reset -or $ForceReenroll) {
+        & dsregcmd /leave 2>&1 | Out-Null
+        $result.Status = 'Reset'
+        $result.FixesApplied += "Azure AD leave (reset)"
+    }
+    
+    # Final sync
+    if ($Sync -and $result.FixesApplied.Count -gt 0) {
+        Start-Sleep -Seconds 10
         Invoke-WmiMethod -Namespace "root\ccm" -Class SMS_Client -Name TriggerSchedule "{00000000-0000-0000-0000-000000000021}" -ErrorAction SilentlyContinue | Out-Null
+    }
+}
+
+$result.Success = $result.FixesApplied.Count -gt 0 -or $result.Status -eq 'Healthy'
+return $result
+'@
+            
+            Set-Content -Path $tempScript -Value $scriptContent
+            $repairResult = & $tempScript @Params
+            Remove-Item $tempScript -Force -ErrorAction SilentlyContinue
+            
+            return $repairResult
+        }
         
-        # Method 3: Settings sync
-        $syncPath = "ms-settings:sync"
-        Start-Process $syncPath -ErrorAction SilentlyContinue
+        $invokeParams = @{
+            ComputerName = $Computer
+            ScriptBlock = $scriptBlock
+            ArgumentList = @(@{
+                AutoFix = $AutoFix
+                Reset = $ResetRegistration
+                ForceReenroll = $ForceReenroll
+                CheckCerts = $CheckCertificates
+                Sync = $TriggerSync
+                WhatIf = $WhatIf
+            })
+            ErrorAction = 'Stop'
+        }
         
-        $script:FixesApplied.Add("Triggered MDM sync")
-        return $true
+        if ($Cred) { $invokeParams.Credential = $Cred }
+        
+        Write-Log "Executing repair on $Computer..." -Level Info
+        $remoteResult = Invoke-Command @invokeParams
+        
+        $result.Success = $remoteResult.Success
+        $result.Status = $remoteResult.Status
+        $result.FixesApplied = $remoteResult.FixesApplied
+        
+        $statusColor = switch ($result.Status) {
+            'Healthy' { 'Green' }
+            'Partial' { 'Yellow' }
+            default { 'White' }
+        }
+        
+        Write-Log "$Computer`: Status = $($result.Status), Fixes = $($result.FixesApplied.Count)" -Level $(if ($result.Success) { 'Success' } else { 'Warning' })
     }
     catch {
-        Write-Log "MDM sync trigger failed: $($_.Exception.Message)" -Level Warning
-        return $false
+        $result.Success = $false
+        $result.Error = $_.Exception.Message
+        Write-Log "Remote repair failed on ${Computer}: $($_.Exception.Message)" -Level Error
     }
+    
+    $script:Results.Add($result)
 }
 #endregion
 
 #region Main Execution
 Show-Header
 
-# Check admin rights
-if (-not (Test-AdminRights)) {
-    Write-Log "This script requires Administrator privileges!" -Level Error
-    Write-Log "Please run PowerShell as Administrator and try again." -Level Warning
-    exit 2
+# Determine computers to process
+$computers = @()
+if ($ComputerName) {
+    $computers = $ComputerName
+} else {
+    $computers = @($env:COMPUTERNAME)
 }
 
-# Get current enrollment state
-Write-Log "Analyzing current enrollment state..." -Level Info
-$enrollmentState = Get-EnrollmentState
-Show-EnrollmentStatus -State $enrollmentState
+Write-Log "Processing $($computers.Count) computer(s)" -Level Info
 
-# If healthy, exit early
-if ($enrollmentState.EnrollmentStatus -eq 'Healthy' -and -not $ResetRegistration -and -not $ForceReenroll) {
-    Write-Log "Device enrollment is healthy! No repairs needed." -Level Success
-    
-    if ($TriggerSync) {
-        Invoke-MDMSync
-    }
-    
-    exit 3
-}
-
-# Perform repairs based on state
-if ($ResetRegistration -or $ForceReenroll) {
-    # Full reset
-    $resetResult = Reset-DeviceRegistration -Force:$ForceReenroll
-    
-    if ($resetResult) {
-        exit 0
-    } else {
-        exit 4
-    }
-}
-
-# Apply fixes
-Write-Host ""
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  APPLYING REPAIRS" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host ""
-
-# Fix 1: Registry repairs
-if ($enrollmentState.EnrollmentStatus -eq 'Partial' -or $enrollmentState.EnrollmentStatus -eq 'Degraded') {
-    Repair-MDMRegistry | Out-Null
-}
-
-# Fix 2: Certificate repairs
-if ($CheckCertificates -or $enrollmentState.Issues -match 'certificate') {
-    Repair-MDMCertificates | Out-Null
-}
-
-# Fix 3: Azure AD sync
-if ($enrollmentState.AzureAdJoined -and $enrollmentState.EnrollmentStatus -ne 'Healthy') {
-    Invoke-AzureADSync | Out-Null
-}
-
-# Fix 4: Trigger MDM enrollment
-if ($enrollmentState.AzureAdJoined -and -not $enrollmentState.MdmEnrolled) {
-    Invoke-MDMEnrollmentTrigger | Out-Null
-}
-
-# Fix 5: Final sync
-if ($TriggerSync -or $script:FixesApplied.Count -gt 0) {
-    Start-Sleep -Seconds 10
-    Invoke-MDMSync | Out-Null
-}
-
-# Re-check state
-Write-Host ""
-Write-Log "Re-checking enrollment state..." -Level Info
-Start-Sleep -Seconds 5
-$newState = Get-EnrollmentState
-Show-EnrollmentStatus -State $newState
-
-# Summary
-Write-Host ""
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  REPAIR SUMMARY" -ForegroundColor Cyan
-Write-Host "========================================" -ForegroundColor Cyan
-Write-Host ""
-
-Write-Log "Issues Found: $($script:IssuesFound.Count)" -Level Info
-Write-Log "Fixes Applied: $($script:FixesApplied.Count)" -Level $(if ($script:FixesApplied.Count -gt 0) { 'Success' } else { 'Info' })
-Write-Log "Fixes Failed: $($script:FixesFailed.Count)" -Level $(if ($script:FixesFailed.Count -gt 0) { 'Error' } else { 'Success' })
-
-if ($script:FixesApplied.Count -gt 0) {
+# Confirmation
+if (-not $Force -and -not $WhatIf -and ($ResetRegistration -or $ForceReenroll)) {
     Write-Host ""
-    Write-Log "Applied Fixes:" -Level Success
-    foreach ($fix in $script:FixesApplied) {
-        Write-Log "  + $fix" -Level Success
+    Write-Log "WARNING: Reset mode selected!" -Level Error
+    $confirm = Read-Host "This will reset device registration. Continue? (Y/N)"
+    if ($confirm -notmatch '^(y|yes)$') {
+        Write-Log "Cancelled by user" -Level Info
+        exit 2
     }
 }
 
-if ($script:FixesFailed.Count -gt 0) {
-    Write-Host ""
-    Write-Log "Failed Fixes:" -Level Error
-    foreach ($fix in $script:FixesFailed) {
-        Write-Log "  - $fix" -Level Error
+# Process each computer
+foreach ($computer in $computers) {
+    if ($computer -eq $env:COMPUTERNAME -or $computer -eq 'localhost' -or $computer -eq '.') {
+        # Local execution
+        Write-Host ""
+        Write-Log "=== Processing Local Machine ===" -Level Info
+        
+        $result = Invoke-LocalRepair -IsAutoFix:$AutoFix -DoReset:$ResetRegistration `
+            -DoForceReenroll:$ForceReenroll -CheckCerts:$CheckCertificates `
+            -DoSync:$TriggerSync -IsWhatIf:$WhatIf
+        
+        $script:Results.Add([PSCustomObject]@{
+            ComputerName = $env:COMPUTERNAME
+            Success = $result.Success
+            Status = $result.Status
+            FixesApplied = $result.FixesApplied
+            Error = $result.Error
+        })
+        
+        if ($result.Status -eq 'Healthy') {
+            Write-Log "Local machine is healthy" -Level Success
+        } else {
+            Write-Log "Local machine status: $($result.Status)" -Level $(if ($result.Success) { 'Success' } else { 'Warning' })
+        }
+    }
+    else {
+        # Remote execution
+        Write-Host ""
+        $cred = if ($Credential) { $Credential } elseif (-not $UseCurrent) {
+            Get-Credential -Message "Enter credentials for $computer"
+        } else { $null }
+        
+        Invoke-RemoteRepair -Computer $computer -Cred $cred
     }
 }
 
-Write-Host ""
-Write-Log "Log saved: $LogPath" -Level Info
+# Show summary
+Show-Summary
 
 # Exit code
-if ($newState.EnrollmentStatus -eq 'Healthy') {
-    Write-Log "Device enrollment is now healthy!" -Level Success
-    exit 0
-} elseif ($newState.EnrollmentStatus -ne $enrollmentState.EnrollmentStatus -or $script:FixesApplied.Count -gt 0) {
-    Write-Log "Partial repairs completed. Reboot may be required." -Level Warning
-    exit 1
-} else {
-    Write-Log "Repairs failed. Manual intervention or reset may be required." -Level Error
-    exit 4
-}
+$failed = ($script:Results | Where-Object { -not $_.Success }).Count
+if ($failed -eq 0) { exit 0 } elseif ($failed -lt $script:Results.Count) { exit 1 } else { exit 4 }
 #endregion
