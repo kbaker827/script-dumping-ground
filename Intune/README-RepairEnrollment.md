@@ -16,44 +16,257 @@ This script identifies and fixes common enrollment issues including:
 
 - ✅ **Comprehensive Diagnosis** - Checks Azure AD, MDM, and certificate health
 - ✅ **Automated Repairs** - Fixes registry, certificates, and triggers re-enrollment
+- ✅ **Remote Execution** - Repair multiple computers from central location
 - ✅ **Safe Operations** - WhatIf mode to preview changes
-- ✅ **Detailed Logging** - Full audit trail of all actions
+- ✅ **Detailed Logging** - Full audit trail on each target and central summary
 - ✅ **Reset Option** - Full registration reset if repairs fail
 - ✅ **Certificate Management** - Detects and removes expired MDM certs
 
 ## Quick Start
 
-### Diagnose and Repair Interactively
+### Diagnose and Repair Interactively (Local)
 ```powershell
 .\Repair-IntuneEnrollment.ps1
 ```
 
-### Auto-Repair (No Prompts)
+### Auto-Repair Local Machine
 ```powershell
 .\Repair-IntuneEnrollment.ps1 -AutoFix
 ```
 
-### Check and Fix Certificates
+### Repair Remote Computer
 ```powershell
-.\Repair-IntuneEnrollment.ps1 -CheckCertificates -TriggerSync
+.\Repair-IntuneEnrollment.ps1 -ComputerName "PC01" -UseCurrent
 ```
 
-### Full Reset (Destructive)
+### Bulk Repair Multiple Computers
 ```powershell
-.\Repair-IntuneEnrollment.ps1 -ResetRegistration -Force
+.\Repair-IntuneEnrollment.ps1 -ComputerName PC01,PC02,PC03 -Credential (Get-Credential)
 ```
 
 ## Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `AutoFix` | switch | `$false` | Apply all safe fixes automatically |
-| `ResetRegistration` | switch | `$false` | **WARNING**: Full reset of device registration |
-| `ForceReenroll` | switch | `$false` | Forces unenrollment and re-enrollment |
-| `CheckCertificates` | switch | `$false` | Verify and repair certificate issues |
-| `TriggerSync` | switch | `$false` | Force MDM sync after repairs |
-| `LogPath` | string | `%TEMP%\IntuneRepair_*.log` | Log file location |
-| `WhatIf` | switch | `$false` | Preview changes without applying |
+| `ComputerName` | string[] | - | Remote computer(s) to repair. Omit for local. |
+| `Credential` | PSCredential | - | Credentials for remote authentication. |
+| `UseCurrent` | switch | `$false` | Use current credentials for remote (no prompt). |
+| `AutoFix` | switch | `$false` | Apply all safe fixes automatically. |
+| `ResetRegistration` | switch | `$false` | **WARNING**: Full reset of device registration. |
+| `ForceReenroll` | switch | `$false` | Forces unenrollment and re-enrollment. |
+| `CheckCertificates` | switch | `$false` | Verify and repair certificate issues. |
+| `TriggerSync` | switch | `$false` | Force MDM sync after repairs. |
+| `LogPath` | string | `%TEMP%\IntuneRepair_*.log` | Log file location. |
+| `WhatIf` | switch | `$false` | Preview changes without applying. |
+
+---
+
+## Local Execution
+
+### Basic Diagnosis (Local)
+```powershell
+.\Repair-IntuneEnrollment.ps1
+```
+Shows current enrollment status and offers to fix issues.
+
+### Silent Auto-Repair (Local)
+```powershell
+.\Repair-IntuneEnrollment.ps1 -AutoFix -LogPath "C:\Logs\IntuneRepair.log"
+```
+Automatically applies safe fixes without prompting.
+
+### Preview Changes (Local)
+```powershell
+.\Repair-IntuneEnrollment.ps1 -WhatIf
+```
+Shows what would be fixed without making changes.
+
+---
+
+## Remote Execution
+
+The script supports running repairs on remote computers via **PowerShell Remoting (WinRM)**.
+
+### Prerequisites for Remote Execution
+
+**On the Target Computers (Run as Administrator):**
+```powershell
+# Enable PowerShell Remoting
+Enable-PSRemoting -Force
+
+# Or use quick config
+winrm quickconfig -q
+
+# Verify WinRM is listening
+Test-WSMan -ComputerName localhost
+```
+
+**Firewall Requirements:**
+- Windows Firewall must allow WinRM (port 5985 for HTTP, 5986 for HTTPS)
+- Or run: `netsh advfirewall firewall set rule group="Windows Remote Management" new enable=yes`
+
+**Authentication:**
+- Target computer must accept credentials from source
+- For workgroup computers: Add to TrustedHosts: `Set-Item WSMan:\localhost\Client\TrustedHosts -Value "*" -Force`
+- For domain computers: Standard Kerberos/NTLM authentication works
+
+### Remote Execution Examples
+
+#### Single Remote Computer
+Repair one computer using current credentials:
+```powershell
+.\Repair-IntuneEnrollment.ps1 -ComputerName "WKSTN-12345" -UseCurrent
+```
+
+#### Single Remote with Explicit Credentials
+```powershell
+$cred = Get-Credential -Message "Enter admin credentials for remote PC"
+.\Repair-IntuneEnrollment.ps1 -ComputerName "WKSTN-12345" -Credential $cred
+```
+
+#### Multiple Remote Computers
+```powershell
+.\Repair-IntuneEnrollment.ps1 -ComputerName "PC01", "PC02", "PC03" -UseCurrent
+```
+
+#### Pipeline from Active Directory
+Get all enabled computers from AD and repair them:
+```powershell
+Get-ADComputer -Filter {Enabled -eq $true} | 
+    Select-Object -ExpandProperty Name | 
+    .\Repair-IntuneEnrollment.ps1 -AutoFix -UseCurrent
+```
+
+#### Pipeline with Specific OU
+Repair computers in a specific Organizational Unit:
+```powershell
+Get-ADComputer -SearchBase "OU=Workstations,OU=Sales,DC=contoso,DC=com" -Filter * | 
+    Select-Object -ExpandProperty Name | 
+    .\Repair-IntuneEnrollment.ps1 -AutoFix -TriggerSync
+```
+
+#### From Text File
+```powershell
+$computers = Get-Content "C:\Scripts\ComputersToRepair.txt"
+.\Repair-IntuneEnrollment.ps1 -ComputerName $computers -Credential (Get-Credential)
+```
+
+#### Bulk Auto-Repair with Certificate Check
+```powershell
+Get-ADComputer -Filter {Enabled -eq $true} | 
+    Select-Object -ExpandProperty Name | 
+    .\Repair-IntuneEnrollment.ps1 -AutoFix -CheckCertificates -TriggerSync
+```
+
+#### Repair and Force Sync
+```powershell
+.\Repair-IntuneEnrollment.ps1 -ComputerName PC01,PC02,PC03 -AutoFix -TriggerSync -UseCurrent
+```
+
+### How Remote Execution Works
+
+1. **Connection Test**
+   - Attempts ping (optional, continues if fails)
+   - Tests WinRM availability with `Test-WSMan`
+
+2. **Script Delivery**
+   - Embeds repair logic in a script block
+   - Transmits to target via `Invoke-Command`
+   - Executes locally on target with admin rights
+
+3. **Status Collection**
+   - Returns enrollment status from target
+   - Lists fixes applied
+   - Reports any errors
+
+4. **Logging**
+   - Creates log file on target: `%TEMP%\IntuneRepair_*.log`
+   - Creates central log on source: `%TEMP%\IntuneRepair_*.log`
+
+### Remote Output Example
+
+```
+========================================
+  Intune Enrollment Repair Tool v1.1
+========================================
+
+[*] Started: 2026-02-13 10:30:15
+[*] Log: C:\Users\admin\AppData\Local\Temp\IntuneRepair_20260213_103015.log
+[*] Processing 3 computer(s)
+
+[*] Connecting to PC01...
+[!] Ping failed for PC01, attempting WinRM anyway...
+[*] Executing repair on PC01...
+[+] PC01: Status = Partial → Healthy, Fixes = 3
+
+[*] Connecting to PC02...
+[*] Executing repair on PC02...
+[+] PC02: Status = Healthy, Fixes = 0
+
+[*] Connecting to PC03...
+[!] Ping failed for PC03, attempting WinRM anyway...
+[*] Executing repair on PC03...
+[+] PC03: Status = Partial → Healthy, Fixes = 2
+
+========================================
+  SUMMARY
+========================================
+
+[*] Total computers: 3
+[+] Successful repairs: 2
+[+] Already healthy: 1
+[+] Failed: 0
+
+[*] Duration: 00:45
+[*] Log saved: C:\Users\admin\AppData\Local\Temp\IntuneRepair_20260213_103015.log
+```
+
+### Troubleshooting Remote Execution
+
+#### "WinRM cannot complete the operation"
+**Cause:** WinRM not enabled on target  
+**Fix:** Run `Enable-PSRemoting -Force` on target
+
+#### "Access is denied"
+**Cause:** Credentials don't have admin rights on target  
+**Fix:** Use domain admin or local admin credentials for target
+
+#### "The RPC server is unavailable"
+**Cause:** Network connectivity or firewall blocking  
+**Fix:** 
+- Check network connectivity
+- Enable Windows Firewall rule for WinRM
+- Verify target computer is online
+
+#### "The WinRM client cannot process the request"
+**Cause:** TrustedHosts not configured for workgroup  
+**Fix:** On source computer: `Set-Item WSMan:\localhost\Client\TrustedHosts -Value "TargetPC" -Force`
+
+### Security Best Practices for Remote
+
+1. **Use Current Credentials When Possible**
+   ```powershell
+   # Better (uses Kerberos)
+   .\Repair-IntuneEnrollment.ps1 -ComputerName PC01 -UseCurrent
+   
+   # Instead of (requires password entry)
+   .\Repair-IntuneEnrollment.ps1 -ComputerName PC01 -Credential (Get-Credential)
+   ```
+
+2. **Limit TrustedHosts**
+   ```powershell
+   # Instead of "*" (all), specify specific computers
+   Set-Item WSMan:\localhost\Client\TrustedHosts -Value "PC01,PC02,PC03" -Force
+   ```
+
+3. **Use HTTPS for WinRM** (if configured)
+   ```powershell
+   # Requires WinRM HTTPS setup on targets
+   $so = New-PSSessionOption -SkipCACheck -SkipCNCheck
+   Invoke-Command -ComputerName PC01 -ScriptBlock { ... } -SessionOption $so -UseSSL
+   ```
+
+---
 
 ## Common Issues Fixed
 
@@ -79,6 +292,8 @@ This script identifies and fixes common enrollment issues including:
 
 **Fix:** Script detects orphaned state and recommends reset or manual re-enrollment.
 
+---
+
 ## Enrollment States
 
 The script detects and reports these states:
@@ -91,66 +306,13 @@ The script detects and reports these states:
 | **Degraded** | Enrolled but certificate issues | Repairs certificates |
 | **NotRegistered** | Not in Azure AD or Intune | Manual enrollment required |
 
-## Examples
-
-### Basic Diagnosis
-```powershell
-.\Repair-IntuneEnrollment.ps1
-```
-Shows current enrollment status and offers to fix issues.
-
-### Silent Auto-Repair
-```powershell
-.\Repair-IntuneEnrollment.ps1 -AutoFix -LogPath "C:\Logs\IntuneRepair.log"
-```
-Automatically applies safe fixes without prompting.
-
-### Preview Changes
-```powershell
-.\Repair-IntuneEnrollment.ps1 -WhatIf
-```
-Shows what would be fixed without making changes.
-
-### Fix Certificate Issues Only
-```powershell
-.\Repair-IntuneEnrollment.ps1 -CheckCertificates -AutoFix
-```
-
-### Complete Reset (Last Resort)
-```powershell
-.\Repair-IntuneEnrollment.ps1 -ResetRegistration
-```
-**WARNING:** This will completely unenroll the device. You'll need to manually re-enroll in Azure AD/Intune.
-
-## What Gets Repaired
-
-### Registry Fixes
-- Enables MDM auto-enrollment policy
-- Removes failed enrollment entries (EnrollmentState = 6)
-- Cleans up corrupted OMADM entries
-
-### Certificate Fixes
-- Detects expired MDM certificates
-- Removes expired certs from LocalMachine\My
-- Removes expired certs from CurrentUser\My
-- Allows fresh certificate enrollment
-
-### Enrollment Triggers
-- Runs dsregcmd /sync
-- Triggers Device Enrollment scheduled task
-- Opens MDM enrollment dialog (ms-device-enrollment:)
-- Opens Work Access settings
-
-### MDM Sync
-- Triggers MDM policy sync
-- Runs scheduled MDM tasks
-- Opens Settings sync page
+---
 
 ## Output Example
 
 ```
 ========================================
-  Intune Enrollment Repair Tool v1.0
+  Intune Enrollment Repair Tool v1.1
 ========================================
 
 [*] Started: 2026-02-13 08:30:15
@@ -213,6 +375,8 @@ Shows what would be fixed without making changes.
 [+] Device enrollment is now healthy!
 ```
 
+---
+
 ## Exit Codes
 
 | Code | Meaning |
@@ -222,6 +386,8 @@ Shows what would be fixed without making changes.
 | 2 | Requires manual intervention / not admin |
 | 3 | No repairs needed (device already healthy) |
 | 4 | Critical failure / needs reset |
+
+---
 
 ## Use Cases
 
@@ -240,12 +406,21 @@ Shows what would be fixed without making changes.
 .\Repair-IntuneEnrollment.ps1 -AutoFix
 ```
 
+### Bulk Department Repair
+```powershell
+Get-ADComputer -SearchBase "OU=Sales,DC=contoso,DC=com" -Filter * | 
+    Select-Object -ExpandProperty Name | 
+    .\Repair-IntuneEnrollment.ps1 -AutoFix -UseCurrent
+```
+
 ### Preparing for Fresh Enrollment
 ```powershell
 # If repairs fail, do full reset
 .\Repair-IntuneEnrollment.ps1 -ResetRegistration -Force
 # Then manually enroll via Settings
 ```
+
+---
 
 ## Troubleshooting
 
@@ -271,10 +446,7 @@ Run PowerShell as Administrator:
 3. Look for "Connect" button or enrollment prompt
 4. If still failing, try `-ResetRegistration` as last resort
 
-### Certificate keeps expiring
-- Check system time is correct
-- Verify NTP sync is working
-- May indicate deeper PKI issues
+---
 
 ## Requirements
 
@@ -282,12 +454,17 @@ Run PowerShell as Administrator:
 - PowerShell 5.1 or PowerShell 7+
 - Administrator rights
 - Internet connectivity to Azure AD/Intune endpoints
+- For remote: WinRM enabled on target computers
+
+---
 
 ## Related Scripts
 
 - `Check-IntuneEnrollment.ps1` - Comprehensive enrollment health check
 - `Get-IntuneInactiveIOSDevices.ps1` - iOS device management
 - `Invoke-DomainJoinPrompt.ps1` - Active Directory domain join
+
+---
 
 ## Safety Notes
 
@@ -296,7 +473,16 @@ Run PowerShell as Administrator:
 - **ResetRegistration** is destructive - only use as last resort
 - **Reboot** may be required after repairs for full effect
 
+---
+
 ## Version History
+
+### 1.1 (2026-02-13)
+- Added remote execution support
+- ComputerName parameter for targeting remote machines
+- Credential and UseCurrent parameters for authentication
+- Pipeline input support from AD or files
+- Central and remote logging
 
 ### 1.0 (2026-02-13)
 - Initial release
@@ -305,97 +491,15 @@ Run PowerShell as Administrator:
 - Full reset capability
 - Detailed logging
 
+---
+
 ## License
 
 MIT License - Use at your own risk. Always test on non-production systems first.
+
+---
 
 ## See Also
 
 - Microsoft Docs: [Troubleshoot Windows device enrollment in Microsoft Intune](https://docs.microsoft.com/mem/intune/troubleshoot-device-enrollment)
 - dsregcmd documentation: [Azure AD joined device verification](https://docs.microsoft.com/azure/active-directory/devices/troubleshoot-device-dsregcmd)
-
----
-
-## Remote Execution
-
-The script supports running repairs on remote computers via PowerShell Remoting.
-
-### Requirements for Remote Execution
-
-**Target Computers Must Have:**
-- Windows PowerShell/WinRM enabled
-- Windows Firewall allowing WinRM (port 5985/5986)
-- Administrator rights for the connecting account
-
-### Enable WinRM on Targets
-```powershell
-Enable-PSRemoting -Force
-# Or:
-winrm quickconfig -q
-```
-
-### Remote Examples
-
-#### Single Remote Computer
-```powershell
-.\Repair-IntuneEnrollment.ps1 -ComputerName "PC01" -UseCurrent
-```
-
-#### Multiple Remote Computers
-```powershell
-.\Repair-IntuneEnrollment.ps1 -ComputerName "PC01", "PC02", "PC03" -Credential (Get-Credential)
-```
-
-#### Pipeline from Active Directory
-```powershell
-Get-ADComputer -Filter {Enabled -eq $true} | 
-    Select-Object -ExpandProperty Name | 
-    .\Repair-IntuneEnrollment.ps1 -AutoFix -UseCurrent
-```
-
-#### Auto-Fix All Domain Computers
-```powershell
-Get-ADComputer -Filter {Enabled -eq $true} | 
-    Select-Object -ExpandProperty Name | 
-    .\Repair-IntuneEnrollment.ps1 -AutoFix -TriggerSync
-```
-
-#### Check Certificates on Remote Machines
-```powershell
-.\Repair-IntuneEnrollment.ps1 -ComputerName (Get-Content computers.txt) -CheckCertificates -TriggerSync -UseCurrent
-```
-
-### Remote Output
-
-When running remotely, the script connects to each computer and:
-1. Tests connectivity (ping then WinRM)
-2. Executes repairs via embedded script block
-3. Returns status and fix summary
-4. Logs details on the remote machine
-
-**Example Remote Output:**
-```
-[*] Connecting to PC01...
-[!] Ping failed for PC01, attempting WinRM anyway...
-[*] Executing repair on PC01...
-[+] PC01: Status = Partial, Fixes = 3
-[*] Connecting to PC02...
-[+] PC02: Status = Healthy, Fixes = 0
-```
-
-### Remote Log Locations
-
-On each target computer, logs are saved to:
-- `C:\Users\<username>\AppData\Local\Temp\IntuneRepair_*.log`
-
-The central log on the executing machine contains:
-- Connection status for each computer
-- Summary of fixes applied
-- Errors encountered
-
-### Security Notes
-
-- Credentials are never logged
-- Use `-UseCurrent` for pass-through authentication when possible
-- For bulk operations, consider using a service account
-- Ensure target computers are in TrustedHosts if workgroup: `Set-Item WSMan:\localhost\Client\TrustedHosts -Value "*" -Force`
