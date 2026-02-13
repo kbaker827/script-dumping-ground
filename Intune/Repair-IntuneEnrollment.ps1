@@ -112,7 +112,6 @@ param(
     
     [string]$LogPath = (Join-Path $env:TEMP "IntuneRepair_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"),
     
-    [switch]$WhatIf,
     [switch]$Force
 )
 
