@@ -1,17 +1,21 @@
 <#
 .SYNOPSIS
-    Updates or installs the new Microsoft Teams client locally or remotely.
+    Installs or updates the new Microsoft Teams client locally or remotely.
 
 .DESCRIPTION
-    This script handles Teams updates/installation with context-aware execution:
+    This script installs or updates Microsoft Teams with context-aware execution:
+    - If Teams is NOT installed: Performs fresh installation
+    - If Teams IS installed: Checks for and applies updates
+    
+    Execution context determines method:
     - SYSTEM context: Uses Teams Bootstrapper for machine-wide provisioning
     - User context: Uses WinGet for per-user installation
-    - Remote execution: Can update Teams on remote computers via PowerShell Remoting
+    - Remote: Can deploy to multiple computers via PowerShell Remoting
     
-    Logs detailed version information before and after updates.
+    Logs detailed version information before and after.
 
 .PARAMETER ComputerName
-    Remote computer(s) to update. If omitted, runs locally.
+    Remote computer(s) to target. If omitted, runs locally.
 
 .PARAMETER Credential
     Credentials for remote authentication.
@@ -31,44 +35,37 @@
 .PARAMETER LogPath
     Path to save detailed log file.
 
-.PARAMETER WhatIf
-    Show what would be done without making changes.
-
 .PARAMETER PassThru
     Return result object instead of exit code.
 
 .EXAMPLE
     .\Update-NewTeams.ps1
-    Updates Teams locally using appropriate method for current context.
+    Installs or updates Teams locally using appropriate method.
 
 .EXAMPLE
     .\Update-NewTeams.ps1 -ComputerName PC01 -UseCurrent
-    Updates Teams on remote computer PC01.
-
-.EXAMPLE
-    .\Update-NewTeams.ps1 -Force
-    Forces reinstallation of Teams locally.
+    Installs or updates Teams on remote computer PC01.
 
 .EXAMPLE
     Get-ADComputer -Filter {Enabled -eq $true} | Select-Object -ExpandProperty Name | .\Update-NewTeams.ps1 -UseCurrent
-    Updates Teams on all domain computers via pipeline.
+    Installs/updates Teams on all domain computers.
 
 .NOTES
-    Version:        3.0
+    Version:        3.1
     Author:         IT Admin
     Updated:        2026-02-13
     
     Requirements:
     - Windows 10/11 (64-bit)
     - PowerShell 5.1 or PowerShell 7+
-    - Internet connectivity for downloads
-    - For remote: WinRM enabled on targets
+    - Internet connectivity
+    - For remote: WinRM enabled
     
     Exit Codes:
-    0   = Success
+    0   = Success (installed or updated)
     1   = WinGet not found (user context)
     2   = Bootstrapper download failed
-    3   = Installation failed
+    3   = Installation/Update failed
     4   = Remote connection failed
     5   = Invalid parameters
     9   = Unexpected error
@@ -98,13 +95,12 @@ param(
 #region Configuration
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:Version = "3.0"
+$script:Version = "3.1"
 $script:StartTime = Get-Date
 $script:Results = [System.Collections.Generic.List[object]]::new()
 
 $WinGetPackageId = 'Microsoft.Teams'
 
-# Set default log path if not provided
 if (-not $LogPath) {
     if ([Security.Principal.WindowsIdentity]::GetCurrent().IsSystem) {
         $LogPath = Join-Path $env:ProgramData "IT\Logs\Update-NewTeams.log"
@@ -122,7 +118,6 @@ function Initialize-LogPath {
             New-Item -ItemType Directory -Force -Path $logDir | Out-Null
         }
         catch {
-            # Fallback to temp
             $script:LogPath = Join-Path $env:TEMP "Update-NewTeams_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
         }
     }
@@ -144,7 +139,6 @@ function Write-Log {
     }
     catch {}
     
-    # Also output to console with colors
     $colors = @{
         Info    = 'White'
         Success = 'Green'
@@ -157,7 +151,7 @@ function Write-Log {
 function Show-Header {
     Write-Host ""
     Write-Host "========================================" -ForegroundColor Cyan
-    Write-Host "  Microsoft Teams Updater v$Version" -ForegroundColor Cyan
+    Write-Host "  Microsoft Teams Installer/Updater v$Version" -ForegroundColor Cyan
     Write-Host "========================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Log "Started: $($script:StartTime.ToString('yyyy-MM-dd HH:mm:ss'))"
@@ -174,10 +168,14 @@ function Show-Summary {
     
     $total = $script:Results.Count
     $success = ($script:Results | Where-Object { $_.ExitCode -eq 0 }).Count
+    $installed = ($script:Results | Where-Object { $_.Action -eq 'Installed' }).Count
+    $updated = ($script:Results | Where-Object { $_.Action -eq 'Updated' }).Count
     $failed = ($script:Results | Where-Object { $_.ExitCode -ne 0 }).Count
     
     Write-Log "Computers processed: $total"
     Write-Log "Successful: $success" $(if ($success -gt 0) { 'Success' } else { 'Info' })
+    if ($installed -gt 0) { Write-Log "New installations: $installed" 'Success' }
+    if ($updated -gt 0) { Write-Log "Updates applied: $updated" 'Success' }
     Write-Log "Failed: $failed" $(if ($failed -gt 0) { 'Error' } else { 'Success' })
     
     if ($failed -gt 0) {
@@ -194,92 +192,127 @@ function Show-Summary {
     Write-Log "Log saved: $LogPath"
 }
 
-function Get-TeamsUserVersion {
+function Test-TeamsInstalled {
+    <#
+    .SYNOPSIS
+    Checks if Microsoft Teams (new) is installed.
+    #>
+    param([switch]$CheckAllUsers)
+    
     try {
-        $package = Get-AppxPackage -Name MSTeams -ErrorAction SilentlyContinue
+        if ($CheckAllUsers) {
+            $package = Get-AppxPackage -AllUsers -Name MSTeams -ErrorAction SilentlyContinue | Select-Object -First 1
+        } else {
+            $package = Get-AppxPackage -Name MSTeams -ErrorAction SilentlyContinue
+        }
+        
         if ($package) {
             return [PSCustomObject]@{
-                Scope = 'Per-User'
+                Installed = $true
                 Version = $package.Version.ToString()
                 PackageFullName = $package.PackageFullName
-                Installed = $true
+                InstallLocation = $package.InstallLocation
             }
         }
     }
     catch {}
     
     return [PSCustomObject]@{
-        Scope = 'Per-User'
+        Installed = $false
         Version = $null
         PackageFullName = $null
-        Installed = $false
+        InstallLocation = $null
     }
 }
 
-function Get-TeamsProvisionedInfo {
-    $info = [PSCustomObject]@{
-        Provisioned = $false
-        ProvisionedVersion = $null
-        InstalledUsers = 0
-        SampleUserVersion = $null
-    }
-    
+function Test-TeamsProvisioned {
+    <#
+    .SYNOPSIS
+    Checks if Teams is machine-wide provisioned (admin only).
+    #>
     try {
-        $provisioned = Get-AppxProvisionedPackage -Online -ErrorAction Stop | 
+        $provisioned = Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | 
             Where-Object { $_.DisplayName -eq 'MSTeams' }
+        
         if ($provisioned) {
-            $info.Provisioned = $true
-            $info.ProvisionedVersion = $provisioned.Version
-        }
-    }
-    catch {}
-    
-    try {
-        $allPackages = Get-AppxPackage -AllUsers -Name MSTeams -ErrorAction SilentlyContinue
-        if ($allPackages) {
-            $installedCount = @($allPackages | Select-Object -ExpandProperty PackageUserInformation -ErrorAction SilentlyContinue | 
-                Where-Object { $_.InstallState -eq 'Installed' }).Count
-            $info.InstalledUsers = $installedCount
-            $sample = $allPackages | Select-Object -First 1
-            if ($sample) {
-                $info.SampleUserVersion = $sample.Version.ToString()
+            return [PSCustomObject]@{
+                Provisioned = $true
+                Version = $provisioned.Version
             }
         }
     }
     catch {}
     
-    return $info
+    return [PSCustomObject]@{
+        Provisioned = $false
+        Version = $null
+    }
 }
 
-function Write-VersionComparison {
-    param(
-        [string]$Label,
-        [PSCustomObject]$Before,
-        [PSCustomObject]$After
-    )
-    
-    $beforeVer = if ($Before.Installed) { $Before.Version } else { '(not installed)' }
-    $afterVer = if ($After.Installed) { $After.Version } else { '(not installed)' }
-    
-    Write-Log "$Label version: $beforeVer -> $afterVer"
-    if ($After.Installed -and $After.PackageFullName) {
-        Write-Log "$Label package: $($After.PackageFullName)"
+function Get-TeamsStatus {
+    <#
+    .SYNOPSIS
+    Gets comprehensive Teams installation status.
+    #>
+    $status = [PSCustomObject]@{
+        Installed = $false
+        Version = $null
+        Provisioned = $false
+        ProvisionedVersion = $null
+        UserCount = 0
+        Action = 'None'
     }
+    
+    # Check current user
+    $userInstall = Test-TeamsInstalled
+    if ($userInstall.Installed) {
+        $status.Installed = $true
+        $status.Version = $userInstall.Version
+    }
+    
+    # Check provisioned (admin only)
+    $provStatus = Test-TeamsProvisioned
+    if ($provStatus.Provisioned) {
+        $status.Provisioned = $true
+        $status.ProvisionedVersion = $provStatus.Version
+    }
+    
+    # Count installed users
+    try {
+        $allPackages = Get-AppxPackage -AllUsers -Name MSTeams -ErrorAction SilentlyContinue
+        if ($allPackages) {
+            $status.UserCount = $allPackages.Count
+        }
+    }
+    catch {}
+    
+    return $status
 }
 #endregion
 
-#region Local Update Functions
-function Update-TeamsAsSystem {
-    Write-Log "Running in SYSTEM context - using Teams Bootstrapper"
+#region Local Functions
+function Install-UpdateTeamsAsSystem {
+    Write-Log "Running in SYSTEM context"
     
-    # Get pre-update state
-    $preProv = Get-TeamsProvisionedInfo
-    Write-Log "Pre-update: Provisioned=$($preProv.Provisioned), Version=$($preProv.ProvisionedVersion), InstalledUsers=$($preProv.InstalledUsers)"
+    # Check current status
+    $status = Get-TeamsStatus
     
-    # Check WhatIf
-    if (-not $PSCmdlet.ShouldProcess("Teams Bootstrapper", "Download and Execute")) {
-        Write-Log "[WHATIF] Would download and run Teams Bootstrapper"
-        return [PSCustomObject]@{ ExitCode = 0; WhatIf = $true }
+    if ($status.Provisioned -and -not $Force) {
+        Write-Log "Teams is already provisioned (Version: $($status.ProvisionedVersion))" 'Success'
+        Write-Log "Checking for updates via Bootstrapper..."
+        $action = 'Update'
+    } else {
+        if ($Force -and $status.Provisioned) {
+            Write-Log "Teams provisioned but -Force specified. Re-provisioning..." 'Warning'
+        } else {
+            Write-Log "Teams is NOT provisioned. Will install..."
+        }
+        $action = 'Install'
+    }
+    
+    if (-not $PSCmdlet.ShouldProcess("Teams Bootstrapper", "$action Teams")) {
+        Write-Log "[WHATIF] Would $action Teams using Bootstrapper"
+        return [PSCustomObject]@{ ExitCode = 0; WhatIf = $true; Action = $action }
     }
     
     # Prepare working directory
@@ -294,20 +327,20 @@ function Update-TeamsAsSystem {
     
     $bootstrapperPath = Join-Path $workDir "teamsbootstrapper.exe"
     
-    # Download bootstrapper if needed
+    # Download bootstrapper
     if (-not (Test-Path $bootstrapperPath) -or $Force) {
-        Write-Log "Downloading Teams Bootstrapper from $BootstrapperUrl..."
+        Write-Log "Downloading Teams Bootstrapper..."
         try {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
             Invoke-WebRequest -UseBasicParsing -Uri $BootstrapperUrl -OutFile $bootstrapperPath -TimeoutSec 180
-            Write-Log "Download completed successfully" 'Success'
+            Write-Log "Download completed" 'Success'
         }
         catch {
-            Write-Log "ERROR: Failed to download Bootstrapper: $($_.Exception.Message)" 'Error'
+            Write-Log "Download failed: $($_.Exception.Message)" 'Error'
             return [PSCustomObject]@{ ExitCode = 2; Error = $_.Exception.Message }
         }
     } else {
-        Write-Log "Using existing Bootstrapper at $bootstrapperPath"
+        Write-Log "Using existing Bootstrapper"
     }
     
     # Run bootstrapper
@@ -317,64 +350,79 @@ function Update-TeamsAsSystem {
         Write-Log "Bootstrapper exit code: $($proc.ExitCode)"
     }
     catch {
-        Write-Log "ERROR: Failed to run Bootstrapper: $($_.Exception.Message)" 'Error'
+        Write-Log "Failed to run Bootstrapper: $($_.Exception.Message)" 'Error'
         return [PSCustomObject]@{ ExitCode = 3; Error = $_.Exception.Message }
     }
     
-    # Get post-update state
+    # Check result
     Start-Sleep -Seconds 3
-    $postProv = Get-TeamsProvisionedInfo
-    Write-Log "Post-update: Provisioned=$($postProv.Provisioned), Version=$($postProv.ProvisionedVersion), InstalledUsers=$($postProv.InstalledUsers)"
+    $newStatus = Get-TeamsStatus
     
     if ($proc.ExitCode -eq 0) {
-        Write-Log "Machine-wide Teams provisioned/updated successfully" 'Success'
-        return [PSCustomObject]@{ ExitCode = 0; ProvisionedVersion = $postProv.ProvisionedVersion }
+        if ($action -eq 'Install') {
+            Write-Log "Teams installed successfully" 'Success'
+        } else {
+            Write-Log "Teams updated successfully" 'Success'
+        }
+        return [PSCustomObject]@{ 
+            ExitCode = 0 
+            Action = $action
+            Version = $newStatus.ProvisionedVersion 
+        }
     } else {
-        Write-Log "ERROR: Bootstrapper returned exit code $($proc.ExitCode)" 'Error'
+        Write-Log "Bootstrapper failed with code $($proc.ExitCode)" 'Error'
         return [PSCustomObject]@{ ExitCode = 3; ExitCodeDetail = $proc.ExitCode }
     }
 }
 
-function Update-TeamsAsUser {
-    Write-Log "Running in user context - using WinGet"
+function Install-UpdateTeamsAsUser {
+    Write-Log "Running in user context"
     
-    # Check for WinGet
+    # Check if already installed
+    $status = Test-TeamsInstalled
+    
+    if ($status.Installed -and -not $Force) {
+        Write-Log "Teams is installed (Version: $($status.Version))" 'Success'
+        Write-Log "Checking for updates via WinGet..."
+        $action = 'Update'
+    } else {
+        if ($Force -and $status.Installed) {
+            Write-Log "Teams installed but -Force specified. Reinstalling..." 'Warning'
+        } else {
+            Write-Log "Teams is NOT installed. Will install..."
+        }
+        $action = 'Install'
+    }
+    
+    # Check WinGet
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if (-not $winget) {
-        Write-Log "ERROR: WinGet not found. Install App Installer from Microsoft Store." 'Error'
+        Write-Log "WinGet not found. Install App Installer from Microsoft Store." 'Error'
         return [PSCustomObject]@{ ExitCode = 1; Error = "WinGet not found" }
     }
     
-    Write-Log "WinGet found at: $($winget.Source)"
+    Write-Log "WinGet found: $($winget.Source)"
     
-    # Get pre-update version
-    $before = Get-TeamsUserVersion
-    Write-Log "Pre-update: Installed=$($before.Installed), Version=$($before.Version)"
-    
-    # Check WhatIf
-    if (-not $PSCmdlet.ShouldProcess("Microsoft.Teams via WinGet", "Install or Upgrade")) {
-        Write-Log "[WHATIF] Would run: winget upgrade/install Microsoft.Teams"
-        return [PSCustomObject]@{ ExitCode = 0; WhatIf = $true }
+    if (-not $PSCmdlet.ShouldProcess("Microsoft.Teams via WinGet", "$action Teams")) {
+        Write-Log "[WHATIF] Would $action Teams using WinGet"
+        return [PSCustomObject]@{ ExitCode = 0; WhatIf = $true; Action = $action }
     }
     
-    # Update sources
+    # Update WinGet sources
     try {
         Write-Log "Refreshing WinGet sources..."
         & $winget.Source update 2>&1 | Out-Null
     }
     catch {
-        Write-Log "WARN: Source update failed (continuing anyway): $($_.Exception.Message)" 'Warning'
+        Write-Log "Source update warning: $($_.Exception.Message)" 'Warning'
     }
     
-    # Try upgrade first, then install
-    $arguments = @(
-        "upgrade",
-        "--id", $WinGetPackageId,
-        "--exact",
-        "--accept-package-agreements",
-        "--accept-source-agreements",
-        "--disable-interactivity"
-    )
+    # Build arguments based on action
+    if ($action -eq 'Update') {
+        $arguments = @("upgrade", "--id", $WinGetPackageId, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity")
+    } else {
+        $arguments = @("install", "--id", $WinGetPackageId, "--exact", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity")
+    }
     
     if ($Force) {
         $arguments += "--force"
@@ -386,34 +434,29 @@ function Update-TeamsAsUser {
         $proc = Start-Process -FilePath $winget.Source -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
         Write-Log "WinGet exit code: $($proc.ExitCode)"
         
-        # WinGet exit codes: 0 = success, -1978335189 = no applicable update found (try install)
-        if ($proc.ExitCode -eq -1978335189 -or $proc.ExitCode -eq 0x8A150014) {
-            Write-Log "Upgrade not applicable; attempting fresh install..."
-            $arguments[0] = "install"
-            Write-Log "Executing: winget $($arguments -join ' ')"
-            $proc = Start-Process -FilePath $winget.Source -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
-            Write-Log "WinGet install exit code: $($proc.ExitCode)"
+        # Handle "no update available" as success for updates
+        if ($action -eq 'Update' -and $proc.ExitCode -eq -1978335189) {
+            Write-Log "No update available - Teams is current" 'Success'
+            return [PSCustomObject]@{ ExitCode = 0; Action = 'UpToDate'; Version = $status.Version }
         }
         
         if ($proc.ExitCode -eq 0) {
-            # Get post-update version
             Start-Sleep -Seconds 3
-            $after = Get-TeamsUserVersion
-            Write-VersionComparison -Label 'Per-user MSTeams' -Before $before -After $after
-            Write-Log "Per-user Teams installed/updated successfully" 'Success'
-            return [PSCustomObject]@{ ExitCode = 0; Version = $after.Version }
+            $newStatus = Test-TeamsInstalled
+            Write-Log "Teams $action completed (Version: $($newStatus.Version))" 'Success'
+            return [PSCustomObject]@{ ExitCode = 0; Action = $action; Version = $newStatus.Version }
         } else {
-            Write-Log "ERROR: WinGet returned exit code $($proc.ExitCode)" 'Error'
+            Write-Log "WinGet failed with code $($proc.ExitCode)" 'Error'
             return [PSCustomObject]@{ ExitCode = 3; ExitCodeDetail = $proc.ExitCode }
         }
     }
     catch {
-        Write-Log "UNEXPECTED ERROR: $($_.Exception.Message)" 'Error'
+        Write-Log "Unexpected error: $($_.Exception.Message)" 'Error'
         return [PSCustomObject]@{ ExitCode = 9; Error = $_.Exception.Message }
     }
 }
 
-function Invoke-LocalUpdate {
+function Invoke-LocalInstallUpdate {
     $isSystem = [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem
     Write-Log "User: $env:USERNAME, IsSystem: $isSystem"
     
@@ -421,22 +464,21 @@ function Invoke-LocalUpdate {
     $method = $InstallMethod
     if ($method -eq 'Auto') {
         $method = if ($isSystem) { 'Bootstrapper' } else { 'WinGet' }
-        Write-Log "Auto-detected install method: $method"
+        Write-Log "Auto-detected method: $method"
     }
     
-    # Execute appropriate method
     switch ($method) {
         'Bootstrapper' {
             if (-not $isSystem) {
                 Write-Log "WARNING: Bootstrapper works best in SYSTEM context" 'Warning'
             }
-            return Update-TeamsAsSystem
+            return Install-UpdateTeamsAsSystem
         }
         'WinGet' {
-            return Update-TeamsAsUser
+            return Install-UpdateTeamsAsUser
         }
         default {
-            Write-Log "ERROR: Unknown install method: $method" 'Error'
+            Write-Log "Unknown method: $method" 'Error'
             return [PSCustomObject]@{ ExitCode = 5; Error = "Unknown method: $method" }
         }
     }
@@ -444,33 +486,28 @@ function Invoke-LocalUpdate {
 #endregion
 
 #region Remote Execution
-function Invoke-RemoteUpdate {
-    param(
-        [string]$Computer,
-        [PSCredential]$Cred
-    )
+function Invoke-RemoteInstallUpdate {
+    param([string]$Computer, [PSCredential]$Cred)
     
     Write-Log "Connecting to $Computer..."
     
     $result = [PSCustomObject]@{
         ComputerName = $Computer
         ExitCode = 0
+        Action = 'None'
         Version = $null
         Error = $null
     }
     
     try {
-        # Test connection
         if (-not (Test-Connection -ComputerName $Computer -Count 1 -Quiet -ErrorAction SilentlyContinue)) {
-            Write-Log "Ping failed for $Computer, trying WinRM anyway..." 'Warning'
+            Write-Log "Ping failed for $Computer, trying WinRM..." 'Warning'
         }
         
-        # Check WinRM
         Test-WSMan -ComputerName $Computer -ErrorAction Stop | Out-Null
         
-        # Build remote script
         $scriptBlock = {
-            param($Params)
+            param($Force, $Method, $BootstrapperUrl)
             
             $tempScript = Join-Path $env:TEMP "UpdateTeams_$(Get-Random).ps1"
             
@@ -479,15 +516,22 @@ param($Force, $Method, $BootstrapperUrl)
 $ErrorActionPreference = 'SilentlyContinue'
 $logPath = Join-Path $env:TEMP "Update-NewTeams_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 
-function Write-Log($Msg) {
-    "$([DateTime]::Now.ToString('s')) $Msg" | Out-File -FilePath $logPath -Append -Encoding UTF8
-}
+function Write-Log($Msg) { "$([DateTime]::Now.ToString('s')) $Msg" | Out-File -FilePath $logPath -Append -Encoding UTF8 }
 
 $isSystem = [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem
-Write-Log "Starting update on $env:COMPUTERNAME, IsSystem=$isSystem"
+Write-Log "Starting on $env:COMPUTERNAME, IsSystem=$isSystem"
+
+# Check if installed
+$installed = Get-AppxPackage -Name MSTeams -ErrorAction SilentlyContinue
+if ($installed -and -not $Force) {
+    Write-Log "Teams installed, checking for updates"
+    $action = 'Update'
+} else {
+    Write-Log "Teams not installed or Force specified"
+    $action = 'Install'
+}
 
 if ($isSystem -or $Method -eq 'Bootstrapper') {
-    # System/Bootstrapper method
     $workDir = Join-Path $env:TEMP "TeamsBootstrapper"
     New-Item -ItemType Directory -Force -Path $workDir | Out-Null
     $bootstrapperPath = Join-Path $workDir "teamsbootstrapper.exe"
@@ -506,27 +550,29 @@ if ($isSystem -or $Method -eq 'Bootstrapper') {
     Write-Log "Bootstrapper exit: $($proc.ExitCode)"
     
     if ($proc.ExitCode -eq 0) {
-        return @{ ExitCode = 0; Method = 'Bootstrapper' }
+        return @{ ExitCode = 0; Action = $action }
     } else {
         return @{ ExitCode = 3; ExitCodeDetail = $proc.ExitCode }
     }
 } else {
-    # WinGet method
     $winget = Get-Command winget -ErrorAction SilentlyContinue
-    if (-not $winget) {
-        return @{ ExitCode = 1; Error = "WinGet not found" }
+    if (-not $winget) { return @{ ExitCode = 1; Error = "WinGet not found" } }
+    
+    if ($action -eq 'Update') {
+        $args = @("upgrade", "--id", "Microsoft.Teams", "--exact", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity")
+    } else {
+        $args = @("install", "--id", "Microsoft.Teams", "--exact", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity")
     }
     
-    $args = @("upgrade", "--id", "Microsoft.Teams", "--exact", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity")
     $proc = Start-Process -FilePath $winget.Source -ArgumentList $args -Wait -PassThru -WindowStyle Hidden
     
-    if ($proc.ExitCode -eq -1978335189) {
-        $args[0] = "install"
-        $proc = Start-Process -FilePath $winget.Source -ArgumentList $args -Wait -PassThru -WindowStyle Hidden
+    if ($proc.ExitCode -eq -1978335189 -and $action -eq 'Update') {
+        Write-Log "No update available"
+        return @{ ExitCode = 0; Action = 'UpToDate' }
     }
     
     if ($proc.ExitCode -eq 0) {
-        return @{ ExitCode = 0; Method = 'WinGet' }
+        return @{ ExitCode = 0; Action = $action }
     } else {
         return @{ ExitCode = 3; ExitCodeDetail = $proc.ExitCode }
     }
@@ -543,45 +589,39 @@ if ($isSystem -or $Method -eq 'Bootstrapper') {
         $invokeParams = @{
             ComputerName = $Computer
             ScriptBlock = $scriptBlock
-            ArgumentList = @(@{
-                Force = $Force
-                Method = $InstallMethod
-                BootstrapperUrl = $BootstrapperUrl
-            })
+            ArgumentList = @(@{ Force = $Force; Method = $InstallMethod; BootstrapperUrl = $BootstrapperUrl })
             ErrorAction = 'Stop'
         }
         
         if ($Cred) { $invokeParams.Credential = $Cred }
         
-        Write-Log "Executing update on $Computer..."
+        Write-Log "Executing on $Computer..."
         $remoteResult = Invoke-Command @invokeParams
         
         $result.ExitCode = $remoteResult.ExitCode
-        $result.Version = $remoteResult.Version
+        $result.Action = $remoteResult.Action
         
         if ($result.ExitCode -eq 0) {
-            Write-Log "$Computer`: Update successful (Method: $($remoteResult.Method))" 'Success'
+            Write-Log "$Computer`: $($result.Action) successful" 'Success'
         } else {
-            Write-Log "$Computer`: Update failed (Exit: $($result.ExitCode))" 'Error'
+            Write-Log "$Computer`: Failed (Exit: $($result.ExitCode))" 'Error'
             $result.Error = $remoteResult.Error
         }
     }
     catch {
         $result.ExitCode = 4
         $result.Error = $_.Exception.Message
-        Write-Log "Remote update failed on ${Computer}: $($_.Exception.Message)" 'Error'
+        Write-Log "Remote failed on ${Computer}: $($_.Exception.Message)" 'Error'
     }
     
     $script:Results.Add($result)
-    return $result
 }
 #endregion
 
-#region Main Execution
+#region Main
 Initialize-LogPath
 Show-Header
 
-# Determine computers to process
 $computers = @()
 if ($ComputerName) {
     $computers = $ComputerName
@@ -591,47 +631,42 @@ if ($ComputerName) {
 
 Write-Log "Processing $($computers.Count) computer(s)"
 
-# Process each computer
 foreach ($computer in $computers) {
     if ($computer -eq $env:COMPUTERNAME -or $computer -eq 'localhost' -or $computer -eq '.') {
-        # Local execution
         Write-Host ""
         Write-Log "=== Processing Local Machine ==="
-        $localResult = Invoke-LocalUpdate
+        $localResult = Invoke-LocalInstallUpdate
         
         $script:Results.Add([PSCustomObject]@{
             ComputerName = $env:COMPUTERNAME
             ExitCode = $localResult.ExitCode
+            Action = $localResult.Action
             Version = $localResult.Version
             Error = $localResult.Error
         })
         
-        if (-not $PassThru) {
+        if (-not $PassThru -and $computers.Count -eq 1) {
             exit $localResult.ExitCode
         }
     }
     else {
-        # Remote execution
         Write-Host ""
         $cred = if ($Credential) { $Credential } elseif (-not $UseCurrent) {
             Get-Credential -Message "Enter credentials for $computer"
         } else { $null }
         
-        Invoke-RemoteUpdate -Computer $computer -Cred $cred | Out-Null
+        Invoke-RemoteInstallUpdate -Computer $computer -Cred $cred
     }
 }
 
-# Show summary for multi-computer operations
 if ($computers.Count -gt 1 -or $ComputerName) {
     Show-Summary
 }
 
-# Return results if PassThru
 if ($PassThru) {
     return $script:Results
 }
 
-# Exit with worst exit code
 $worstExit = ($script:Results | Measure-Object -Property ExitCode -Maximum).Maximum
 exit $worstExit
 #endregion
