@@ -29,6 +29,7 @@ This script handles computer renaming during the Autopilot enrollment process, e
 | `MaxSerialLength` | Int | `12` | Max characters from serial number |
 | `DomainName` | String | `""` | Domain name (for hybrid join context) |
 | `RestartAfterRename` | Switch | `$false` | Automatically restart after rename |
+| `WhatIf` | Switch | `$false` | Preview changes without applying them (alias: `TestMode`) |
 
 ## Usage Examples
 
@@ -47,6 +48,57 @@ This script handles computer renaming during the Autopilot enrollment process, e
 ```powershell
 .\Rename-Computer-Autopilot.ps1 -NamingPrefix "LAPTOP"
 # Tries asset tag first, falls back to serial if unavailable
+```
+
+### Example 4: Preview changes without renaming (WhatIf mode)
+```powershell
+.\Rename-Computer-Autopilot.ps1 -NamingPrefix "CORP" -UseSerialNumber -WhatIf
+# Shows what would happen without making any changes
+```
+
+## Testing with -WhatIf
+
+Before deploying to production, test the script's naming logic using `-WhatIf` (or `-TestMode`):
+
+```powershell
+# Preview the rename operation
+.\Rename-Computer-Autopilot.ps1 -NamingPrefix "CORP" -UseSerialNumber -WhatIf
+```
+
+**WhatIf mode shows you:**
+- Current vs proposed computer name
+- Domain join status and Autopilot ESP state
+- Actions that would be performed
+- Validation of name length and characters
+- The exact command to run for real
+
+**Example output:**
+```
+╔════════════════════════════════════════════════════════════════╗
+║                     WHATIF MODE SUMMARY                        ║
+╚════════════════════════════════════════════════════════════════╝
+
+Current Computer Name: DESKTOP-ABC123
+Proposed New Name:     CORP-C02ABC123456
+
+System State:
+  • Domain Joined:     True
+  • Domain:            contoso.com
+  • In Autopilot ESP:  True
+  • Pending Reboot:    False
+
+Actions that WOULD be performed:
+  → Rename computer from 'DESKTOP-ABC123' to 'CORP-C02ABC123456'
+    (Using domain-joined rename method)
+  → Create marker file at: %ProgramData%\AutopilotRename\rename-completed.marker
+  → Defer restart (name takes effect on next reboot)
+
+Validation:
+  ✓ Name length OK (≤15 chars)
+  ✓ Name characters OK
+
+To apply these changes, run without -WhatIf:
+  .\Rename-Computer-Autopilot.ps1 -NamingPrefix "CORP" -UseSerialNumber
 ```
 
 ## Deployment Options
