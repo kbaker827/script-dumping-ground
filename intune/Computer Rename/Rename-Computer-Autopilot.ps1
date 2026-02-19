@@ -13,14 +13,16 @@
     - Intune PowerShell script
     - Proactive remediation script
     
+    WHATIF MODE: Use -WhatIf or -TestMode to preview changes without applying them.
+    
 .NOTES
-    Version:        1.0
+    Version:        1.1
     Author:         IT Admin
     Creation Date:  2025-02-19
     Requirements:   Windows 10/11, Autopilot, Hybrid Join
 #>
 
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess=$true)]
 param(
     [Parameter()]
     [string]$NewComputerName = "",
@@ -38,12 +40,19 @@ param(
     [string]$DomainName = "",
     
     [Parameter()]
-    [switch]$RestartAfterRename
+    [switch]$RestartAfterRename,
+    
+    [Parameter(HelpMessage="Preview changes without applying them")]
+    [Alias("TestMode")]
+    [switch]$WhatIf
 )
 
 # Configuration
 $LogPath = "$env:ProgramData\Microsoft\IntuneManagementExtension\Logs"
 $LogFile = "$LogPath\AutopilotComputerRename.log"
+
+# Track WhatIf state
+$script:IsWhatIf = $WhatIf
 
 # Ensure log directory exists
 if (!(Test-Path -Path $LogPath)) {
@@ -51,11 +60,12 @@ if (!(Test-Path -Path $LogPath)) {
 }
 
 function Write-Log {
-    param([string]$Message, [string]$Level = "INFO")
+    param([string]$Message, [string]$Level = "INFO", [switch]$WhatIfTag)
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logEntry = "[$timestamp] [$Level] $Message"
+    $whatIfPrefix = if ($WhatIfTag -or $script:IsWhatIf) { "[WHATIF] " } else { "" }
+    $logEntry = "[$timestamp] [$Level] $whatIfPrefix$Message"
     Add-Content -Path $LogFile -Value $logEntry
-    Write-Verbose $logEntry
+    Write-Host $logEntry
 }
 
 function Get-SafeComputerName {
@@ -93,7 +103,7 @@ function Get-ComputerNameFromSource {
     
     if ($UseSerial) {
         try {
-            $serial = (Get-WmiObject -Class Win32_BIOS).SerialNumber
+            $serial = (Get-CimInstance -ClassName Win32_BIOS).SerialNumber
             # Clean and truncate serial
             $serial = ($serial -replace '[^A-Z0-9]', '').Substring(0, [Math]::Min($MaxSerialLength, $serial.Length))
             return "$Prefix-$serial"
@@ -106,7 +116,7 @@ function Get-ComputerNameFromSource {
     
     # Generate name based on asset tag if available
     try {
-        $assetTag = (Get-WmiObject -Class Win32_SystemEnclosure).SMBIOSAssetTag
+        $assetTag = (Get-CimInstance -ClassName Win32_SystemEnclosure).SMBIOSAssetTag
         if ($assetTag -and $assetTag -notin @("No Asset Tag", "None", "")) {
             return "$Prefix-$assetTag"
         }
@@ -119,10 +129,114 @@ function Get-ComputerNameFromSource {
     return Get-ComputerNameFromSource -Prefix $Prefix -UseSerial
 }
 
+function Show-WhatIfSummary {
+    param(
+        [string]$CurrentName,
+        [string]$ProposedName,
+        [bool]$DomainJoined,
+        [string]$Domain,
+        [bool]$InESP,
+        [bool]$PendingReboot
+    )
+    
+    Write-Host "`n╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║                     WHATIF MODE SUMMARY                        ║" -ForegroundColor Cyan
+    Write-Host "╚════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "Current Computer Name: " -NoNewline
+    Write-Host $CurrentName -ForegroundColor Yellow
+    Write-Host "Proposed New Name:     " -NoNewline
+    Write-Host $ProposedName -ForegroundColor Green
+    Write-Host ""
+    Write-Host "System State:" -ForegroundColor White
+    Write-Host "  • Domain Joined:     $DomainJoined" -ForegroundColor $(if ($DomainJoined) { "Green" } else { "Gray" })
+    if ($DomainJoined) {
+        Write-Host "  • Domain:            $Domain" -ForegroundColor Gray
+    }
+    Write-Host "  • In Autopilot ESP:  $InESP" -ForegroundColor $(if ($InESP) { "Green" } else { "Gray" })
+    Write-Host "  • Pending Reboot:    $PendingReboot" -ForegroundColor $(if ($PendingReboot) { "Yellow" } else { "Green" })
+    Write-Host ""
+    Write-Host "Actions that WOULD be performed:" -ForegroundColor White
+    
+    if ($CurrentName -eq $ProposedName) {
+        Write-Host "  ✓ No action needed - names match" -ForegroundColor Green
+    }
+    else {
+        Write-Host "  → Rename computer from '$CurrentName' to '$ProposedName'" -ForegroundColor Yellow
+        if ($DomainJoined) {
+            Write-Host "    (Using domain-joined rename method)" -ForegroundColor Gray
+        }
+        else {
+            Write-Host "    (Using workgroup/Azure AD rename method)" -ForegroundColor Gray
+        }
+        Write-Host "  → Create marker file at: %ProgramData%\AutopilotRename\rename-completed.marker" -ForegroundColor Yellow
+        
+        if ($RestartAfterRename) {
+            Write-Host "  → Schedule restart in 60 seconds" -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "  → Defer restart (name takes effect on next reboot)" -ForegroundColor Gray
+        }
+    }
+    
+    Write-Host ""
+    Write-Host "Validation:" -ForegroundColor White
+    
+    # Validate name length
+    if ($ProposedName.Length -gt 15) {
+        Write-Host "  ⚠ WARNING: Name exceeds 15 chars (NetBIOS limit)" -ForegroundColor Red
+    }
+    else {
+        Write-Host "  ✓ Name length OK (≤15 chars)" -ForegroundColor Green
+    }
+    
+    # Check for invalid chars
+    if ($ProposedName -match '[^A-Z0-9-]') {
+        Write-Host "  ⚠ WARNING: Name contains invalid characters" -ForegroundColor Red
+    }
+    else {
+        Write-Host "  ✓ Name characters OK" -ForegroundColor Green
+    }
+    
+    Write-Host ""
+    Write-Host "To apply these changes, run without -WhatIf:" -ForegroundColor Cyan
+    Write-Host "  .\Rename-Computer-Autopilot.ps1" -ForegroundColor White -NoNewline
+    if ($NamingPrefix -ne "CORP") { Write-Host " -NamingPrefix `"$NamingPrefix`"" -ForegroundColor White -NoNewline }
+    if ($UseSerialNumber) { Write-Host " -UseSerialNumber" -ForegroundColor White -NoNewline }
+    if ($RestartAfterRename) { Write-Host " -RestartAfterRename" -ForegroundColor White -NoNewline }
+    if ($NewComputerName) { Write-Host " -NewComputerName `"$NewComputerName`"" -ForegroundColor White -NoNewline }
+    Write-Host ""
+    Write-Host ""
+}
+
 # ==================== MAIN EXECUTION ====================
+
+if ($script:IsWhatIf) {
+    Write-Log "=== WHATIF MODE - NO CHANGES WILL BE MADE ===" "INFO"
+}
 
 Write-Log "=== Autopilot Computer Rename Script Started ==="
 Write-Log "Current computer name: $env:COMPUTERNAME"
+
+# Gather system info early for WhatIf mode
+$computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem
+$isDomainJoined = $computerSystem.PartOfDomain
+$currentDomain = $computerSystem.Domain
+$inESP = Test-AutopilotESP
+
+# Check for pending reboot
+$pendingReboot = $false
+try {
+    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") {
+        $pendingReboot = $true
+    }
+    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") {
+        $pendingReboot = $true
+    }
+}
+catch {
+    Write-Log "Could not check pending reboot status" "WARN"
+}
 
 # Determine new computer name
 if ([string]::IsNullOrEmpty($NewComputerName)) {
@@ -139,6 +253,14 @@ if ([string]::IsNullOrEmpty($NewComputerName)) {
 $NewComputerName = Get-SafeComputerName -BaseName $NewComputerName
 Write-Log "Target computer name: $NewComputerName"
 
+# Show WhatIf summary and exit
+if ($script:IsWhatIf) {
+    Show-WhatIfSummary -CurrentName $env:COMPUTERNAME -ProposedName $NewComputerName `
+        -DomainJoined $isDomainJoined -Domain $currentDomain `
+        -InESP $inESP -PendingReboot $pendingReboot
+    exit 0
+}
+
 # Check if rename is needed
 if ($env:COMPUTERNAME -eq $NewComputerName) {
     Write-Log "Computer already has correct name. No action needed." "INFO"
@@ -147,27 +269,7 @@ if ($env:COMPUTERNAME -eq $NewComputerName) {
 
 # Validate we're in a good state to rename
 Write-Log "Checking system state..."
-
-# Check if domain joined (for hybrid join)
-$computerSystem = Get-WmiObject -Class Win32_ComputerSystem
-$isDomainJoined = $computerSystem.PartOfDomain
-$currentDomain = $computerSystem.Domain
-
 Write-Log "Domain joined: $isDomainJoined | Current domain: $currentDomain"
-
-# Check for pending reboot
-$pendingReboot = $false
-try {
-    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending") {
-        $pendingReboot = $true
-    }
-    if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired") {
-        $pendingReboot = $true
-    }
-}
-catch {
-    Write-Log "Could not check pending reboot status" "WARN"
-}
 
 if ($pendingReboot) {
     Write-Log "Pending reboot detected. Rename should be deferred." "WARN"
