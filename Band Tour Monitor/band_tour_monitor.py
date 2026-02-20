@@ -3,7 +3,7 @@
 Band Tour Date Monitor for Telegram
 Monitors Bandsintown API for concert dates and sends Telegram alerts
 
-Tracks: Metallica, Green Day, Five Finger Death Punch
+Tracks: Metallica, Green Day, Five Finger Death Punch, Taylor Swift, Nickelback, Godsmack, 3 Doors Down, Aerosmith, Soundgarden, The Smashing Pumpkins, Staind
 Location: North Carolina, USA
 """
 
@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 # Configuration
-BANDS = ["Metallica", "Green Day", "Five Finger Death Punch"]
+BANDS = ["Metallica", "Green Day", "Five Finger Death Punch", "Taylor Swift", "Nickelback", "Godsmack", "3 Doors Down", "Aerosmith", "Soundgarden", "The Smashing Pumpkins", "Staind"]
 STATE_FILTER = "NC"  # North Carolina
 STATE_FULL = "North Carolina"
 DATA_FILE = Path.home() / ".band_tour_tracker.json"
