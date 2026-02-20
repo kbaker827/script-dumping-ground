@@ -1,76 +1,105 @@
 # Script Dumping Ground
 
-Welcome to my collection of PowerShell, Bash, and other utility scripts. This is my personal repository for scripts I either stumble across that prove useful, or tools I've written myself to solve real-world problems.
+A collection of PowerShell, Python, and Bash scripts for IT administration, automation, and monitoring.
 
-## What's Here?
+## 📁 Repository Structure
 
-This repo is exactly what the name suggests—a **dumping ground**. It's not polished software, it's not a framework, and it's definitely not enterprise-grade code (most of the time). It's a mix of:
+### **Intune/**
+Windows deployment and management scripts for Microsoft Intune.
 
-- **Scripts I found** - Useful tools from the community that I want to save and share
-- **Scripts I wrote** - Solutions to problems I've encountered in IT administration
-- **Quick fixes** - One-off tools that solved a specific issue
-- **Proof-of-concepts** - Ideas that worked well enough to keep around
+| Category | Description |
+|----------|-------------|
+| **Branding/** | Corporate wallpaper, lock screen, OEM configuration |
+| **Browsers/** | Chrome/Edge enterprise configuration |
+| **Computer Rename/** | Autopilot computer rename with hybrid join support |
+| **Copy Folder Script/** | Folder deployment with config files |
+| **Inventory/** | Software inventory and auditing |
+| **Maintenance/** | Disk cleanup, system maintenance |
+| **Network/** | VPN profiles, certificates, WiFi profiles |
+| **Printers/** | Network printer deployment |
+| **Software/** | Third-party software installers (TightVNC, Trend WFBS, etc.) |
+| **Wireless Profile Copy/** | WiFi profile deployment |
 
-## Organization
+### **Band Tour Monitor/**
+Concert tour date monitoring for 17 bands in North Carolina.
 
-The repo is organized into folders by category or tool. Each folder typically contains:
-- The main script(s)
-- A README with usage instructions
-- Sometimes example data or configuration files
+### **HomeAssistant/**
+Smart home automation and control scripts.
 
-## Using These Scripts
+### **Maintenance/**
+Backup verification and system health checks.
 
-**⚠️ Important:** These scripts are provided as-is. Before running anything:
+### **Monitoring/**
+Event and schedule monitoring:
+- Hurricanes NHL games
+- Comic book conventions and store events
+- Local comic shop event scrapers
 
-1. **Read the README** in each folder for specific requirements and usage
-2. **Test in a non-production environment** first
-3. **Review the code** - understand what it does before executing
-4. **Run with appropriate privileges** - many scripts require admin rights
+### **Security/**
+Security auditing and hardening scripts.
 
-## Categories
+### **Utils/**
+Repository management and dependency checking tools.
 
-### Office & Productivity
-- **Office/Office Removal/** - Remove Microsoft Office 365 from macOS and Windows
+## 🚀 Quick Start
 
-### System Administration
-- **GroupPolicy/** - Remote Group Policy refresh tools
-- **Intune/** - Microsoft Intune management and troubleshooting
-- **PDQ/** - PDQ Deploy integration scripts
+### Band Tour Monitor
+```bash
+cd "Band Tour Monitor"
+python3 band_tour_monitor.py --setup
+python3 band_tour_monitor.py --test
+```
 
-### Windows Management
-- **Windows-10-Scripts/** - Windows 10/11 utilities
-- **WindowMover/** - Save and restore window layouts
-- **Dell Bloatware Remover/** - Clean up Dell pre-installed software
+### Intune Scripts
+```powershell
+# Example: Deploy WiFi profile
+.\Intune\Wireless Profile Copy\Install-WirelessProfile.ps1 -ProfileXML "wifi.xml"
 
-### Cloud & Collaboration
-- **SharePoint-OneDrive/** - SharePoint and OneDrive management tools
-- **AdobeAcrobat/** - Adobe Acrobat troubleshooting
+# Example: Install software
+.\Intune\Software\Dell Command Update\Install-DellCommandUpdate.ps1 -NoReboot
+```
 
-### Infrastructure
-- **Square9/** - Square 9 GlobalSearch management
+### Home Assistant Control
+```bash
+python3 HomeAssistant/ha_control.py dashboard
+python3 HomeAssistant/ha_control.py on light.kitchen
+```
 
-### General Utilities
-- **script-dumping-ground/** (root level) - Miscellaneous scripts
+## 📊 Stats
 
-## Contributing
+- **105+ scripts** across multiple categories
+- **17 bands** monitored for concerts
+- **8 comic shops** tracked for events
+- **NHL team** schedule monitoring
+- **Automated documentation** generation
 
-Feel free to use, modify, and share these scripts. If you have improvements or fixes, they're welcome. This is a public repo because I believe in sharing solutions to common problems.
+## 🔄 Automation
 
-## Disclaimer
+These scripts are designed to run via:
+- **OpenClaw Heartbeat** - Automated periodic checks
+- **Intune** - Windows device management
+- **Cron** - Scheduled task execution
+- **Manual execution** - One-off operations
 
-**Use at your own risk.** These scripts perform various system-level operations including:
-- Software installation and removal
-- Registry modifications
-- File system changes
-- Service and process management
-- Remote command execution
+## 📝 Recent Updates
 
-Always test thoroughly in your environment before production use.
+- Added 17 bands to tour monitor
+- Added Carolina Hurricanes schedule tracking
+- Added comic book event monitoring
+- Added local comic shop scraper
+- Added security audit script
+- Added backup verification
+- Added dependency checker
+- Added auto-documentation tool
 
-## License
+## ⚠️ Security Note
 
-Unless otherwise noted, scripts are provided under the MIT License. See individual scripts for specific licensing information.
+Scripts in this repository require Administrator/root privileges in many cases. Review scripts before running in production environments.
+
+## 📄 License
+
+MIT License - Feel free to use and modify.
 
 ---
 
-*This repository is maintained by Kyle Baker. It's a living collection that grows as I encounter new problems and solutions in the wild world of IT administration.*
+*Last updated: February 2026*
