@@ -1,10 +1,10 @@
 # Band Tour Date Monitor
 
-Monitors concert tour dates for **Metallica** and **Green Day** in **North Carolina** and sends alerts via Telegram.
+Monitors concert tour dates for **Metallica**, **Green Day**, and **Five Finger Death Punch** in **North Carolina** and sends alerts via Telegram.
 
 ## Features
 
-- 🎸 Tracks Metallica and Green Day tour announcements
+- 🎸 Tracks Metallica, Green Day, and Five Finger Death Punch tour announcements
 - 📍 Filters for shows in North Carolina only
 - 🤖 Sends Telegram notifications for new shows
 - 💾 Remembers shows it's already seen (no duplicate alerts)
